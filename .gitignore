@@ -1,2 +1,4 @@
 .venv/
 .venv
+__pycache__/
+safe_ssh_mcp.egg-info/

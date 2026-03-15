@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safe-ssh-mcp"
+version = "0.1.0"
+description = "A secure and scoped SSH Model Context Protocol (MCP) server for executing safe, read-only diagnostic commands only"
+authors = [
+  { name="Anton Areso Gladyshev", email="returnstrike@yandex.com" }
+]
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "uvicorn",
+    "paramiko",
+    "fastmcp"
+]
+[project.urls]
+"Homepage" = "https://github.com/Areso/safe-ssh-mcp"
+
+[project.scripts]
+safe-ssh-mcp = "mcp_ssh:main"
+
+[tool.setuptools]
+py-modules = ["mcp_ssh"]

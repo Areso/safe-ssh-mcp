@@ -1,0 +1,37 @@
+name: Publish to PyPI
+
+# This tells GitHub to only run this when you publish a new Release on GitHub
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi-publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    
+    # This environment name MUST match what you typed in PyPI
+    environment:
+      name: pypi
+      url: https://pypi.org/p/safe-ssh-mcp
+      
+    # This is the magic permission that allows the secure OIDC token exchange
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Installs uv instantly
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # Uses uv to build your dist/ folder
+      - name: Build package
+        run: uv build
+
+      # Uses the official PyPI action to handle the secure upload
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@release/v1

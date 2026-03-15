@@ -390,7 +390,7 @@ def get_top(
 
 ## == END OF TOOLS == ##
 
-if __name__ == "__main__":
+def main():
     cfg = load_config()
     transport_type = cfg.get("transport", "sse")
     host = cfg["host"]
@@ -401,3 +401,6 @@ if __name__ == "__main__":
     else:
         # Fallback to standard I/O for CLI/Desktop clients
         mcp.run(transport="stdio")
+
+if __name__ == "__main__":
+    main()
