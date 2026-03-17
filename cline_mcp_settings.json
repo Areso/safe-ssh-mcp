@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "safe-ssh-mcp": {
+      "disabled": false,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "/full_path/safe-ssh-mcp/.venv/bin/python3.11",
+      "args": [
+        "/full_path/safe-ssh-mcp/mcp_ssh.py",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
