@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safe-ssh-mcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "A secure and scoped SSH Model Context Protocol (MCP) server for executing safe, read-only diagnostic commands only"
 authors = [
   { name="Anton Areso Gladyshev", email="returnstrike@yandex.com" }
