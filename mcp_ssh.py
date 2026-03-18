@@ -24,7 +24,7 @@ def load_config():
     config = configparser.ConfigParser()
     # Default values
     settings = {
-        "transport": "http",  # streamable-http, http, sse
+        "transport": "stdio",  # streamable-http, http, sse, stdio
         "host": "127.0.0.1",
         "port": "8000"
     }
