@@ -22,6 +22,9 @@ The core philosophy behind this MCP server is safety first. Instead of providing
 10. get_systemd_status : `systemctl status {daemon}`
 11. get_top : `top -b -n 1 -c`
 
+## Example of invocation
+`okay, could u check disk usage on /root/ path with help of safe-ssh-mcp server on a remote myserver.mydomain.pro using root and /Users/myUser/.ssh/id_rsa to login?`
+
 ## Project Contents
 1. mcp_ssh.py - the SSH MCP server
 2. mcp_config.ini - the server's config:
