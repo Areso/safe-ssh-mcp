@@ -403,7 +403,12 @@ def get_systemd_status(
     """
     Gets the detailed status, logs, and error messages for a SPECIFIC systemd daemon/service/unit.
     """
-    cmd = f"systemctl status {daemon}"
+    VALID_DAEMON_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_@:]+$")
+    if not VALID_DAEMON_PATTERN.match(daemon):
+        return {"ok": False, "error": "Invalid daemon name: '{daemon}'. Only ASCII alphanumeric "
+            "characters, '.', '-', '_', '@', and ':' are allowed."}
+    safe_daemon = shlex.quote(daemon)
+    cmd = f"systemctl status {safe_daemon}"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()

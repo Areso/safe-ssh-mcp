@@ -11,7 +11,7 @@ The core philosophy behind this MCP server is safety first. Instead of providing
 
 ## Available Tools (Partial List)
 1. get_disk_free : `df -h`
-2. get_disk_usage : `du -sh {path}/* 2>/dev/null | sort -rh | head -n 20`
+2. get_disk_usage : `find <path> -mindepth 1 -maxdepth 1 -exec du -sh -- {} + 2>/dev/null | sort -rh | head -n 20`
 3. get_dmesg : `dmesg`
 4. get_uptime : `uptime`
 5. get_current_datetime : `date`

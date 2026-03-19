@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safe-ssh-mcp"
-version = "0.1.4"
+version = "0.1.5"
 description = "A secure and scoped SSH Model Context Protocol (MCP) server for executing safe, read-only diagnostic commands only"
 authors = [
   { name="Anton Areso Gladyshev", email="returnstrike@yandex.com" }
@@ -17,7 +17,6 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
-    "uvicorn",
     "paramiko",
     "fastmcp"
 ]
