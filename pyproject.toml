@@ -20,6 +20,13 @@ dependencies = [
     "paramiko>=4.0.0,<5",
     "fastmcp>=3.1.1,<4"
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-mock>=3.14,<4",
+    "pytest-cov>=6.0,<7",
+]
 [project.urls]
 "Homepage" = "https://github.com/Areso/safe-ssh-mcp"
 
@@ -28,3 +35,15 @@ safe-ssh-mcp = "mcp_ssh:main"
 
 [tool.setuptools]
 py-modules = ["mcp_ssh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["mcp_ssh"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
