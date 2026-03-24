@@ -2,3 +2,7 @@
 .venv
 __pycache__/
 safe_ssh_mcp.egg-info/
+coverage.xml
+.coverage
+htmlcov/
+dist/
