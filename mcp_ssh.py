@@ -420,8 +420,8 @@ def get_systemd_status(
     """
     VALID_DAEMON_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_@:]+$")
     if not VALID_DAEMON_PATTERN.match(daemon):
-        return {"ok": False, "error": "Invalid daemon name: '{daemon}'. Only ASCII alphanumeric "
-            "characters, '.', '-', '_', '@', and ':' are allowed."}
+        return {"ok": False, 
+                "error": f"Invalid daemon name: '{daemon}'. Only ASCII alphanumeric characters, '.', '-', '_', '@', and ':' are allowed."}
     safe_daemon = shlex.quote(daemon)
     cmd = f"systemctl status {safe_daemon}"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
@@ -592,8 +592,8 @@ def get_service_logs_from_journalctl(
     """
     VALID_SERVICE_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_@:]+$")
     if not VALID_SERVICE_PATTERN.match(service):
-        return {"ok": False, "error": "Invalid service name: '{service}'. Only ASCII alphanumeric "
-            "characters, '.', '-', '_', '@', and ':' are allowed."}
+        return {"ok": False, 
+                "error": f"Invalid service name: '{service}'. Only ASCII alphanumeric characters, '.', '-', '_', '@', and ':' are allowed."}
 
     # Explicitly exclude booleans (Best practice for duck typing)
     if not isinstance(lines, int) or isinstance(lines, bool) or not (1 <= lines <= 1000):
