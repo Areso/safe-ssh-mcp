@@ -125,7 +125,7 @@ class TestSystemdStatusValidation:
         result = mcp_ssh.get_systemd_status(daemon="bad input!", host="h", user="u")
         assert result["ok"] is False
         # BUG: the error message uses a non-f-string, so it contains the literal '{daemon}'
-        assert "'{daemon}'" in result["error"]
+        assert "bad input!" in result["error"]
 
 
 # ============================================================
