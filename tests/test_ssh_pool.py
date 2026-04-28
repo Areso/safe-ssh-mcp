@@ -111,8 +111,11 @@ class _StopJanitor(Exception):
 class TestCleanupIdleConnections:
 
     def _run_one_janitor_pass(self, mocker):
-        """Let the loop body execute once, then stop on the second sleep."""
-        mocker.patch("mcp_ssh.time.sleep", side_effect=[None, _StopJanitor])
+        """Let the loop body execute once, then exit infinite loop."""
+        mocker.patch(
+            "mcp_ssh.shutdown_event.wait", 
+            side_effect=[None, _StopJanitor]
+        )
         with pytest.raises(_StopJanitor):
             mcp_ssh._cleanup_idle_connections()
 
