@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
+## [0.1.16] - 2026-11-09
+### Added
+- New tool `get_installed_packages` — lists installed packages with versions using
+  the first available package manager: `dpkg-query -W`, `rpm -qa` or `apk info -v`.
+- New tool `get_kernel_version` — kernel name, release, build version and
+  architecture (`uname -srvm`).
+- New tool `get_libc_version` — C library implementation and version
+  (`ldd --version`; musl detected via `/lib/ld-musl-*`).
+- New tool `get_sshd_effective_config` — effective sshd configuration (`sshd -T`);
+  usually requires root.
+- New tool `get_php_info` — PHP CLI version and SAPI, installed `php-cgi` /
+  `php-fpm` binaries with versions, running php-fpm/php-cgi processes, and
+  Apache mod_php status (enabled `LoadModule` directives and `apachectl -M`).
+- New tool `get_docker_images` — local images with digests (`docker images --digests`).
+- New tool `get_lockfiles` — finds `composer.lock`, `package-lock.json` and
+  `requirements*.txt` under given app paths (skipping `node_modules`, `vendor`, `.git`,
+  venvs); optionally prints their contents (capped at 20 files, 100 KB each).
+
 ## [0.1.15] - 2026-08-19
 - added support for SSH keys protected by passphrase
 - to use protected keys either set SSH_KEY_PASSPHRASE var in the env

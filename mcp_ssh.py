@@ -7,7 +7,7 @@ import configparser
 import json
 import os
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, ContextManager
+from typing import Optional, Dict, Any, ContextManager, List
 from contextlib import contextmanager
 import signal
 import threading
@@ -110,6 +110,61 @@ def load_config():
     return settings
 
 # ---- SSH helpers ----
+SSH_KEY_PASSPHRASE_METHOD_ENV_VAR = "ENV_VAR"
+SSH_KEY_PASSPHRASE_METHOD_KEYCHAIN = "KEYCHAIN"
+SSH_KEY_PASSPHRASE_METHODS = {
+    SSH_KEY_PASSPHRASE_METHOD_ENV_VAR,
+    SSH_KEY_PASSPHRASE_METHOD_KEYCHAIN,
+}
+ssh_key_passphrase_method = SSH_KEY_PASSPHRASE_METHOD_ENV_VAR
+
+
+def get_ssh_auth_options(key_path: Optional[str]) -> Dict[str, Any]:
+    """Build Paramiko authentication options from the configured key source."""
+    if ssh_key_passphrase_method == SSH_KEY_PASSPHRASE_METHOD_ENV_VAR:
+        return {
+            "key_filename": key_path,
+            "passphrase": os.environ.get("SSH_KEY_PASSPHRASE"),
+            "allow_agent": False,
+            "look_for_keys": True,
+        }
+
+    if ssh_key_passphrase_method == SSH_KEY_PASSPHRASE_METHOD_KEYCHAIN:
+        # The key is already unlocked in ssh-agent; do not read key_path directly.
+        return {
+            "key_filename": None,
+            "passphrase": None,
+            "allow_agent": True,
+            "look_for_keys": False,
+        }
+
+    raise ValueError(
+        f"Unsupported ssh_key_passphrase_method: {ssh_key_passphrase_method}"
+    )
+
+
+def connect_ssh_client(
+    client: paramiko.SSHClient,
+    host: str,
+    user: str,
+    port: int,
+    password: Optional[str],
+    key_path: Optional[str],
+    timeout: int,
+) -> None:
+    """Connect using the configured SSH key passphrase source."""
+    client.connect(
+        hostname=host,
+        port=port,
+        username=user,
+        password=password,
+        timeout=timeout,
+        banner_timeout=timeout,
+        auth_timeout=timeout,
+        **get_ssh_auth_options(key_path),
+    )
+
+
 SSH_POOL: Dict[str, Dict[str, Any]] = {}
 pool_lock = threading.Lock()
 IDLE_TIMEOUT_SECONDS = 300
@@ -177,18 +232,7 @@ def ssh_session(
     )
 
     try:
-        client.connect(
-            hostname=host,
-            port=port,
-            username=user,
-            password=password,
-            key_filename=key_path,
-            timeout=timeout,
-            banner_timeout=timeout,
-            auth_timeout=timeout,
-            look_for_keys=True,
-            allow_agent=True,
-        )
+        connect_ssh_client(client, host, user, port, password, key_path, timeout)
         yield client
     finally:
         client.close()
@@ -238,18 +282,7 @@ def get_ssh_client(
             paramiko.AutoAddPolicy() if accept_new_hostkey else paramiko.RejectPolicy()
         )
 
-        client.connect(
-            hostname=host,
-            port=port,
-            username=user,
-            password=password,
-            key_filename=key_path,
-            timeout=timeout,
-            banner_timeout=timeout,
-            auth_timeout=timeout,
-            look_for_keys=True,
-            allow_agent=True,
-        )
+        connect_ssh_client(client, host, user, port, password, key_path, timeout)
         
         # 3. Save to pool WITH the current timestamp
         SSH_POOL[pool_key] = {
@@ -320,6 +353,15 @@ def run_ssh_command(
     # 3. Catch specific network/protocol errors for better AI debugging
     except socket.error as e:
         return {"ok": False, "error": f"Network error: Could not connect to {host}:{port}. ({str(e)})"}
+    except paramiko.PasswordRequiredException:
+        return {
+            "ok": False,
+            "error": (
+                "The SSH key is passphrase-protected. Set SSH_KEY_PASSPHRASE "
+                "or set ssh_key_passphrase_method=KEYCHAIN and unlock the key "
+                "with ssh-add."
+            ),
+        }
     except paramiko.SSHException as e:
         return {"ok": False, "error": f"SSH protocol error: {str(e)}"}
     except Exception as e:
@@ -477,11 +519,80 @@ def get_list_of_files_with_filter(
 
     cmd = f"ls {quoted_path} -lah | grep {quoted_filter} "
     result = run_ssh_command(
-        host, user, cmd, port, password, key_path, timeout, accept_new_hostkey, 
+        host, user, cmd, port, password, key_path, timeout, accept_new_hostkey,
         success_exit_codes=(0, 1) # du may return 1 on partial permission denied
     )
     if result["ok"]:
         result["path"] = abs_path
+    return result
+
+@mcp.tool()
+def get_lockfiles(
+    host: str,
+    user: str,
+    abs_paths: List[str],
+    include_contents: bool = False,
+    max_depth: int = 4,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 30,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Finds dependency lockfiles (composer.lock, package-lock.json, requirements*.txt)
+    under the given absolute app paths on a remote Linux host via SSH.
+    Skips node_modules, vendor, .git, venv and .venv directories.
+    Lists the files found (ls -l); with include_contents=True also prints each file,
+    capped at the first 100 KB per file and 20 files.
+    """
+    FORBIDDEN_CHARS = r'[|&;<>()$`{}]'
+    MAX_PATHS = 10
+    MAX_FILES_WITH_CONTENTS = 20
+    MAX_BYTES_PER_FILE = 100_000
+
+    if not isinstance(abs_paths, list) or not abs_paths:
+        return {"ok": False, "error": "abs_paths must be a non-empty list of absolute paths"}
+    if len(abs_paths) > MAX_PATHS:
+        return {"ok": False, "error": f"At most {MAX_PATHS} paths are allowed"}
+    if not isinstance(max_depth, int) or isinstance(max_depth, bool) or not (1 <= max_depth <= 10):
+        return {"ok": False, "error": "Invalid value of max_depth, should be Integer from 1 to 10"}
+
+    normalized_paths = []
+    for abs_path in abs_paths:
+        if not isinstance(abs_path, str):
+            logger.error(f"get_lockfiles tool: Path must be string")
+            return {"ok": False, "error": "Path must be a string"}
+        if os.name != 'nt':  # Skip local path validation on Windows (wrong for remote Linux)
+            abs_path = os.path.normpath(abs_path)
+            if not os.path.isabs(abs_path):
+                logger.error(f"get_lockfiles tool: Path must be absolute")
+                return {"ok": False, "error": f"Path must be absolute: {abs_path}"}
+        if re.search(FORBIDDEN_CHARS, abs_path):
+            logger.error(f"get_lockfiles tool: Path contains forbidden characters |&;<>()$`{{}}")
+            return {"ok": False, "error": "Path contains forbidden characters |&;<>()$`{}"}
+        normalized_paths.append(abs_path)
+
+    quoted_paths = " ".join(shlex.quote(p) for p in normalized_paths)
+    find_cmd = (
+        f"find {quoted_paths} -maxdepth {max_depth} "
+        r"\( -name node_modules -o -name vendor -o -name .git -o -name venv -o -name .venv \) -prune -o "
+        r"-type f \( -name composer.lock -o -name package-lock.json -o -name 'requirements*.txt' \)"
+    )
+    if include_contents:
+        cmd = (
+            f"{find_cmd} -print 2>/dev/null | head -n {MAX_FILES_WITH_CONTENTS} | "
+            f'while IFS= read -r f; do echo "===== $f ====="; head -c {MAX_BYTES_PER_FILE} "$f"; echo; done'
+        )
+    else:
+        # busybox find has no -printf, so ls -l for size and mtime
+        cmd = f"{find_cmd} -exec ls -l {{}} + 2>/dev/null"
+    result = run_ssh_command(
+        host, user, cmd, port, password, key_path, timeout, accept_new_hostkey,
+        success_exit_codes=(0, 1) # find returns 1 on partial permission denied
+    )
+    if result["ok"]:
+        result["paths"] = normalized_paths
     return result
 
 @mcp.tool()
@@ -513,6 +624,29 @@ def get_is_installed(
     return run_ssh_command(
         host, user, cmd, port, password, key_path, timeout, accept_new_hostkey
     )
+
+@mcp.tool()
+def get_installed_packages(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Lists installed packages with versions on a remote Linux host via SSH.
+    Uses the first available package manager: dpkg-query -W (Debian/Ubuntu),
+    rpm -qa (RHEL/Fedora/SUSE) or apk info -v (Alpine).
+    """
+    cmd = (
+        "if command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W; "
+        "elif command -v rpm >/dev/null 2>&1; then rpm -qa; "
+        "elif command -v apk >/dev/null 2>&1; then apk info -v; "
+        "else echo 'No supported package manager found (dpkg, rpm, apk)' >&2; exit 127; fi"
+    )
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
 def get_dmesg(
@@ -573,6 +707,114 @@ def get_distroname_version(
     Collects distr details from os-release from a remote Linux host via SSH
     """
     return run_ssh_command(host, user, "cat /etc/os-release", port, password, key_path, timeout, accept_new_hostkey)
+
+@mcp.tool()
+def get_kernel_version(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Collects kernel name, release, build version and architecture (uname -srvm) from a remote Linux host via SSH
+    """
+    return run_ssh_command(host, user, "uname -srvm", port, password, key_path, timeout, accept_new_hostkey)
+
+@mcp.tool()
+def get_libc_version(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Collects C library implementation and version (glibc or musl) from a remote Linux host via SSH.
+    Uses ldd --version; musl is detected by the presence of /lib/ld-musl-* loader.
+    """
+    # musl's ldd prints its version to stderr and exits 1, hence 2>&1 and head
+    cmd = (
+        "if ls /lib/ld-musl-* >/dev/null 2>&1; then ls /lib/ld-musl-*; ldd --version 2>&1 | head -n 2; "
+        "else ldd --version 2>&1 | head -n 1; fi"
+    )
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+@mcp.tool()
+def get_sshd_effective_config(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Collects the effective sshd configuration (sshd -T) from a remote Linux host via SSH.
+    Shows the final values after defaults, includes and Match blocks are applied.
+    Usually requires root, since sshd -T reads the host keys.
+    """
+    # sshd lives in /usr/sbin, which is often not in PATH for non-root users
+    cmd = 'SSHD=$(command -v sshd || echo /usr/sbin/sshd); "$SSHD" -T'
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+@mcp.tool()
+def get_php_info(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Collects PHP details from a remote Linux host via SSH: CLI version and SAPI,
+    installed CGI (php-cgi) and FPM (php-fpm) binaries with their versions/SAPIs,
+    whether php-fpm or php-cgi processes are currently running, and, if Apache
+    is installed, whether mod_php is enabled in its config and loaded.
+    """
+    # Distros name binaries differently (php-cgi8.2, php-fpm8.2, php-fpm82), hence the globs.
+    # php-cgi -v reports "(cgi-fcgi)", php-fpm -v reports "(fpm-fcgi)".
+    list_bins = (
+        'found=0; for b in {globs}; do [ -x "$b" ] && '
+        '{{ echo "$b: $("$b" -v 2>/dev/null | head -n 1)"; found=1; }}; done; '
+        '[ "$found" = 1 ] || echo "none"'
+    )
+    cmd = "; ".join([
+        "echo '== CLI =='",
+        "if command -v php >/dev/null 2>&1; then php -v 2>/dev/null | head -n 1; "
+        "php -r 'echo \"SAPI: \", PHP_SAPI, PHP_EOL;'; else echo 'not installed'; fi",
+        "echo '== CGI binaries =='",
+        list_bins.format(globs="/usr/bin/php-cgi* /usr/local/bin/php-cgi*"),
+        "echo '== FPM binaries =='",
+        list_bins.format(globs="/usr/sbin/php-fpm* /usr/local/sbin/php-fpm*"),
+        "echo '== Running processes =='",
+        # pgrep matches the process name, not args, so it can't match this bash -c itself
+        "pgrep -a '^php[0-9.]*-(fpm|cgi)' || echo 'no php-fpm or php-cgi processes'",
+        "echo '== Apache mod_php =='",
+        "A=$(command -v apache2 || command -v httpd || ls /usr/sbin/apache2 /usr/sbin/httpd 2>/dev/null | head -n 1)",
+        "if [ -z \"$A\" ]; then echo 'apache not installed'; else "
+        "echo \"$A: $(\"$A\" -v 2>/dev/null | head -n 1)\"; "
+        # Only enabled config: Debian mods-enabled, RHEL conf.modules.d + httpd.conf, Alpine httpd.conf + conf.d.
+        # Explicit globs rather than grep -r, which skips Debian's mods-enabled symlinks.
+        # grep exits 2 when any listed path is missing (always true across distros), so test output instead
+        "echo 'Enabled LoadModule directives:'; "
+        "M=$(grep -hsiE '^[[:space:]]*LoadModule[[:space:]]+php[0-9_]*_module' "
+        "/etc/apache2/mods-enabled/*.load /etc/apache2/httpd.conf /etc/apache2/conf.d/*.conf "
+        "/etc/httpd/conf/httpd.conf /etc/httpd/conf.modules.d/*.conf); "
+        "if [ -n \"$M\" ]; then echo \"$M\"; else echo '  none (mod_php not enabled)'; fi; "
+        # apachectl -M reports what is really loaded, but often needs root to read the config
+        "echo 'Loaded modules (apachectl -M):'; "
+        "(apachectl -M || apache2ctl -M) 2>/dev/null | grep -i 'php' "
+        "|| echo '  no php module reported (or apachectl -M needs root)'; fi",
+    ])
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
 def get_systemd_list_all(
@@ -762,6 +1004,23 @@ def get_docker_ps_all(
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
+def get_docker_images(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Collects docker images --digests output (repository, tag, digest, image ID, age, size) from a remote Linux host via SSH
+    """
+    # No -a: it only adds untagged intermediate build layers, which are noise for diagnostics
+    cmd = "docker images --digests"
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+@mcp.tool()
 def get_crontab_tasks(
     host: str,
     user: str,
@@ -825,6 +1084,8 @@ def get_service_logs_from_journalctl(
 
 
 def main():
+    global ssh_key_passphrase_method
+
     # 1. Set up command line arguments
     parser = argparse.ArgumentParser(description="Safe SSH MCP Server")
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], 
@@ -836,6 +1097,14 @@ def main():
     # 2. Load config file
     cfg = load_config()
     logger.debug("Loaded config")
+    ssh_key_passphrase_method = cfg.get(
+        "ssh_key_passphrase_method", SSH_KEY_PASSPHRASE_METHOD_ENV_VAR
+    ).strip().upper()
+    if ssh_key_passphrase_method not in SSH_KEY_PASSPHRASE_METHODS:
+        parser.error(
+            "Invalid ssh_key_passphrase_method. "
+            f"Choose one of: {', '.join(sorted(SSH_KEY_PASSPHRASE_METHODS))}."
+        )
     # 3. CLI arguments take priority over config file
     transport_type = args.transport or cfg.get("transport", "stdio")
     host = args.host or cfg.get("host", "127.0.0.1")

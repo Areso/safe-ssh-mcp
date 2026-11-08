@@ -358,3 +358,38 @@ class TestListFilesWithFilterValidation:
         assert cmd.startswith("ls ")
         assert "-lah" in cmd
         assert "| grep" in cmd
+
+
+# ============================================================
+# get_lockfiles — input validation
+# ============================================================
+
+class TestLockfilesValidation:
+    @pytest.mark.parametrize("abs_paths", [[], "/app", None, ["/a"] * 11])
+    def test_bad_path_list_rejected(self, abs_paths, mock_run_ssh_command):
+        result = mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=abs_paths)
+        assert result["ok"] is False
+        mock_run_ssh_command.assert_not_called()
+
+    def test_relative_path_rejected(self, mock_run_ssh_command):
+        result = mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/ok", "relative/app"])
+        assert result["ok"] is False
+        assert "absolute" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("char", list("|&;<>()$`{}"))
+    def test_forbidden_char_rejected(self, char, mock_run_ssh_command):
+        result = mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=[f"/app{char}x"])
+        assert result["ok"] is False
+        assert "forbidden characters" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("max_depth", [0, 11, True, "3"])
+    def test_bad_max_depth_rejected(self, max_depth, mock_run_ssh_command):
+        result = mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/app"], max_depth=max_depth)
+        assert result["ok"] is False
+        mock_run_ssh_command.assert_not_called()
+
+    def test_path_normalized(self, mock_run_ssh_command):
+        result = mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/var/www/../app/"])
+        assert result["paths"] == ["/var/app"]

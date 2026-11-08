@@ -26,6 +26,62 @@ class TestGetSshClient:
         mock_paramiko_client.connect.assert_called_once()
         assert make_pool_key("host1", "user1", 22) in mcp_ssh.SSH_POOL
 
+    def test_env_var_passphrase_is_used_for_private_key(
+        self, mock_paramiko_client, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mcp_ssh,
+            "ssh_key_passphrase_method",
+            mcp_ssh.SSH_KEY_PASSPHRASE_METHOD_ENV_VAR,
+        )
+        monkeypatch.setenv("SSH_KEY_PASSPHRASE", "key-passphrase")
+
+        mcp_ssh.get_ssh_client(
+            "host1",
+            "user1",
+            password="account-password",
+            key_path="/tmp/id_ed25519",
+        )
+
+        assert mock_paramiko_client.connect.call_args.kwargs == {
+            "hostname": "host1",
+            "port": 22,
+            "username": "user1",
+            "password": "account-password",
+            "timeout": 10,
+            "banner_timeout": 10,
+            "auth_timeout": 10,
+            "key_filename": "/tmp/id_ed25519",
+            "passphrase": "key-passphrase",
+            "allow_agent": False,
+            "look_for_keys": True,
+        }
+
+    def test_keychain_uses_ssh_agent_without_reading_key_file(
+        self, mock_paramiko_client, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mcp_ssh,
+            "ssh_key_passphrase_method",
+            mcp_ssh.SSH_KEY_PASSPHRASE_METHOD_KEYCHAIN,
+        )
+
+        mcp_ssh.get_ssh_client("host1", "user1", key_path="/tmp/id_ed25519")
+
+        assert mock_paramiko_client.connect.call_args.kwargs == {
+            "hostname": "host1",
+            "port": 22,
+            "username": "user1",
+            "password": None,
+            "timeout": 10,
+            "banner_timeout": 10,
+            "auth_timeout": 10,
+            "key_filename": None,
+            "passphrase": None,
+            "allow_agent": True,
+            "look_for_keys": False,
+        }
+
     def test_pool_key_format(self, mock_paramiko_client):
         mcp_ssh.get_ssh_client("10.0.0.1", "admin", 2222)
         assert make_pool_key("10.0.0.1", "admin", 2222) in mcp_ssh.SSH_POOL

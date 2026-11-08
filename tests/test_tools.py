@@ -15,6 +15,7 @@ import mcp_ssh
     (mcp_ssh.get_uptime, "uptime"),
     (mcp_ssh.get_current_datetime, "date"),
     (mcp_ssh.get_distroname_version, "cat /etc/os-release"),
+    (mcp_ssh.get_kernel_version, "uname -srvm"),
     (mcp_ssh.get_systemd_list_all, "systemctl list-units --all --no-pager"),
     (mcp_ssh.get_systemd_list_failed, "systemctl list-units --state=failed --no-pager"),
     (mcp_ssh.get_systemd_list_timers, "systemctl list-timers --no-pager"),
@@ -25,6 +26,7 @@ import mcp_ssh
     (mcp_ssh.get_top, "top -b -n 1 -c"),
     (mcp_ssh.get_lsblk, "lsblk"),
     (mcp_ssh.get_docker_ps_all, "docker ps --all"),
+    (mcp_ssh.get_docker_images, "docker images --digests"),
     (mcp_ssh.get_crontab_tasks, "crontab -l"),
     (mcp_ssh.get_listening_sockets, "ss -tulpn"),
 ])
@@ -189,3 +191,92 @@ def test_list_files_filter_success_exit_codes(mock_run_ssh_command):
 def test_list_files_filter_empty_filter(mock_run_ssh_command):
     mcp_ssh.get_list_of_files_with_filter(host="h", user="u", abs_path="/data", filter="")
     mock_run_ssh_command.assert_called_once()
+
+
+# ============================================================
+# get_installed_packages — package manager detection chain
+# ============================================================
+
+def test_installed_packages_command_building(mock_run_ssh_command):
+    mcp_ssh.get_installed_packages(host="h", user="u")
+    mock_run_ssh_command.assert_called_once()
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert "dpkg-query -W" in cmd
+    assert "rpm -qa" in cmd
+    assert "apk info -v" in cmd
+    # dpkg is preferred over rpm (rpm can be installed on Debian too), rpm over apk
+    assert cmd.index("dpkg-query -W") < cmd.index("rpm -qa") < cmd.index("apk info -v")
+
+
+# ============================================================
+# get_libc_version — glibc / musl detection
+# ============================================================
+
+def test_libc_version_command_building(mock_run_ssh_command):
+    mcp_ssh.get_libc_version(host="h", user="u")
+    mock_run_ssh_command.assert_called_once()
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert "ls /lib/ld-musl-*" in cmd
+    # musl's ldd writes the version to stderr
+    assert "ldd --version 2>&1" in cmd
+
+
+# ============================================================
+# get_sshd_effective_config — sshd -T with /usr/sbin fallback
+# ============================================================
+
+def test_sshd_effective_config_command_building(mock_run_ssh_command):
+    mcp_ssh.get_sshd_effective_config(host="h", user="u")
+    mock_run_ssh_command.assert_called_once()
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert '"$SSHD" -T' in cmd
+    assert "/usr/sbin/sshd" in cmd
+
+
+# ============================================================
+# get_php_info — CLI / CGI / FPM detection
+# ============================================================
+
+def test_php_info_command_building(mock_run_ssh_command):
+    mcp_ssh.get_php_info(host="h", user="u")
+    mock_run_ssh_command.assert_called_once()
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert "php -v" in cmd
+    assert "PHP_SAPI" in cmd
+    assert "/usr/bin/php-cgi*" in cmd
+    assert "/usr/sbin/php-fpm*" in cmd
+    assert "pgrep -a" in cmd
+
+
+def test_php_info_checks_mod_php(mock_run_ssh_command):
+    mcp_ssh.get_php_info(host="h", user="u")
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert "command -v apache2 || command -v httpd" in cmd
+    assert "/etc/apache2/mods-enabled/*.load" in cmd
+    assert "/etc/httpd/conf.modules.d/*.conf" in cmd
+    assert "apachectl -M" in cmd
+
+
+# ============================================================
+# get_lockfiles — command building
+# ============================================================
+
+def test_lockfiles_command_building(mock_run_ssh_command):
+    mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/var/www/app", "/srv/my app"])
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert cmd.startswith("find /var/www/app '/srv/my app' -maxdepth 4 ")
+    assert "-name composer.lock" in cmd
+    assert "-name package-lock.json" in cmd
+    assert "-name 'requirements*.txt'" in cmd
+    assert "-name node_modules" in cmd and "-prune" in cmd
+    assert "-exec ls -l {} +" in cmd
+    assert "head -c" not in cmd
+    assert mock_run_ssh_command.call_args[1].get("success_exit_codes") == (0, 1)
+
+
+def test_lockfiles_include_contents(mock_run_ssh_command):
+    mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/app"], include_contents=True, max_depth=2)
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert "-maxdepth 2 " in cmd
+    assert "head -n 20" in cmd
+    assert 'head -c 100000 "$f"' in cmd
