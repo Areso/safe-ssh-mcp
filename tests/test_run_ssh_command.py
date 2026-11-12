@@ -30,6 +30,35 @@ class TestRunSshCommandSuccess:
         assert result["ok"] is False
         assert result["data"]["exit_code"] == 1
 
+    def test_command_runs_in_bash_with_sh_fallback(self, mock_ssh_client):
+        mcp_ssh.run_ssh_command("h", "u", "echo 'it works'", timeout_s=7)
+        remote_cmd = mock_ssh_client.exec_command.call_args[0][0]
+        assert remote_cmd == (
+            """timeout 7s sh -c 'exec "$(command -v bash || echo sh)" -c "$0"' 'echo '"'"'it works'"'"''"""
+        )
+
+    @pytest.mark.parametrize("exit_code", [124, -1])
+    def test_timeout_is_reported(self, mock_ssh_client, mocker, exit_code):
+        mock_ssh_client.exec_command.return_value[1].channel.recv_exit_status.return_value = exit_code
+        mocker.patch("mcp_ssh.time.monotonic", side_effect=[100.0, 107.2])
+        result = mcp_ssh.run_ssh_command("h", "u", "sleep 60", timeout_s=7)
+        assert result["ok"] is False
+        assert result["data"]["timed_out"] is True
+        assert result["error"].startswith("The command probably timed out: it was stopped after the 7s timeout")
+
+    @pytest.mark.parametrize("exit_code, elapsed", [
+        (124, 0.3),   # a command that itself exits 124 quickly
+        (-1, 0.3),    # killed by a signal for another reason
+        (1, 9.0),     # slow, but an ordinary failure
+        (0, 9.0),
+    ])
+    def test_no_timeout_reported(self, mock_ssh_client, mocker, exit_code, elapsed):
+        mock_ssh_client.exec_command.return_value[1].channel.recv_exit_status.return_value = exit_code
+        mocker.patch("mcp_ssh.time.monotonic", side_effect=[100.0, 100.0 + elapsed])
+        result = mcp_ssh.run_ssh_command("h", "u", "cmd", timeout_s=7)
+        assert "timed_out" not in result["data"]
+        assert "error" not in result
+
     def test_custom_success_exit_codes(self, mock_ssh_client):
         stdout_mock = mock_ssh_client.exec_command.return_value[1]
         stdout_mock.channel.recv_exit_status.return_value = 1

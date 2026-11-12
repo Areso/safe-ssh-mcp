@@ -11,18 +11,45 @@ In this project, "safe" refers specifically to host safety: the server is design
 The core philosophy behind this MCP server is safety first. Instead of providing an AI agent with an unrestricted bash shell, this server exposes only carefully curated, read-only commands for system diagnostics and monitoring.
 
 ## Available Tools (Partial List)
-1. get_disk_free : `df -h`
-2. get_disk_usage : `find <path> -mindepth 1 -maxdepth 1 -exec du -sh -- {} + 2>/dev/null | sort -rh | head -n 20`
-3. get_dmesg : `dmesg`
-4. get_uptime : `uptime`
-5. get_current_datetime : `date`
-6. get_distroname_version : `cat /etc/os-release`
-7. get_systemd_list_all : `systemctl list-units --all --no-pager`
-8. get_systemd_list_failed : `systemctl list-units --state=failed --no-pager`
-9. get_systemd_list_timers : `systemctl list-timers --no-pager`
-10. get_crontab_tasks: `crontab -l`
-11. get_systemd_status : `systemctl status {daemon}`
-12. get_top : `top -b -n 1 -c`
+A few examples from each group; `<...>` marks a validated parameter.
+
+**Disk and filesystems**
+- get_disk_free : `df -h`
+- get_disk_usage : `find <path> -mindepth 1 -maxdepth 1 -exec du -sh -- {} + 2>/dev/null | sort -rh | head -n 20`
+- get_mounts : `findmnt` (or `cat /proc/mounts`)
+
+**CPU, memory and processes**
+- get_top : `top -b -n 1 -c`
+- get_vmstat : `vmstat 1 5`
+- get_pressure : `cat /proc/pressure/{cpu,io,memory}`
+
+**Systemd and logs**
+- get_systemd_list_failed : `systemctl list-units --state=failed --no-pager`
+- get_systemd_status : `systemctl status <daemon>`
+- get_journal_errors : `journalctl -p warning -n <lines> --no-pager`
+- get_dmesg : `dmesg`
+
+**Network**
+- get_listening_sockets : `ss -tulpn`
+- get_ip_route : `ip route show` and `ip -6 route show`
+- get_dns_lookup : `getent ahosts <name>` or `dig <name> <record_type>`
+- check_tcp_connect : `nc -vz -w 3 <target_host> <target_port>`
+
+**Docker**
+- get_docker_ps_all : `docker ps --all`
+- get_docker_logs : `docker logs --tail <lines> <container>`
+- get_docker_stats : `docker stats --no-stream`
+
+**Kubernetes**
+- get_kubectl_events : `kubectl get events --sort-by=.lastTimestamp`
+- get_kubectl_logs : `kubectl logs --tail=<lines> --namespace=<namespace> <pod>`
+- get_crictl_ps : `crictl ps --all`
+
+**System, logins and crashes**
+- get_distroname_version : `cat /etc/os-release`
+- get_installed_packages : `dpkg-query -W` (with source package), `rpm -qa` or `/lib/apk/db/installed` (with origin)
+- get_failed_logins : `lastb -F -n <lines>`
+- get_coredumps : `coredumpctl list --no-pager`
 
 Click to open [full list of available tools](tools.md)  
 
