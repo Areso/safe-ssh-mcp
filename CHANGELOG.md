@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
+## 0.2.1 - 2026-11-14
+### Added
+- Shared validator `is_valid_systemd_unit_name` / `systemd_unit_name_error`.
+
+### Changed
+- The log file moved out of the working directory. The default is now a per-user
+  path: `$XDG_STATE_HOME/safe-ssh-mcp/` or `~/.local/state/safe-ssh-mcp/` on Linux,
+  `~/Library/Logs/safe-ssh-mcp/` on macOS, `%LOCALAPPDATA%\safe-ssh-mcp\Logs\` on
+  Windows. Set `SAFE_SSH_MCP_LOG_FILE=safe-ssh-mcp.log` to get the old behaviour.
+- The log is rotated at 5 MB with 3 old files kept, and the default level is `INFO`
+  instead of `DEBUG` (`SAFE_SSH_MCP_LOG_LEVEL=DEBUG` brings it back).
+- If the log file cannot be created or opened, the server starts without logging and
+  says why on stderr, instead of failing at import.
+
+### Fixed
+- Security: `get_systemd_status` no longer accepts a unit name that starts with `-`
+  (it was read as a systemctl option; `-Hroot@otherhost` made systemctl connect to
+  another host) and passes the name after `--`. A trailing newline is rejected too.
+  The error now says what exactly is wrong with the name. `-.mount` and `-.slice`
+  can no longer be asked for.
+- Security: `get_list_of_files_with_filter` passes the filter to grep with `-e`. A
+  filter starting with `-` was read as grep options; `-rne.` made grep print the
+  contents of every file under the SSH user's home directory.
+
 ## 0.2.0 - 2026-11-12
 ### Added
 - New tool `get_hostname` — the host's own name (`uname -n`, so it works without the

@@ -1,4 +1,6 @@
 """Shared fixtures for safe-ssh-mcp tests."""
+import os
+import tempfile
 import threading
 import time
 
@@ -20,6 +22,10 @@ def _safe_thread_start(self):
 
 
 threading.Thread.start = _safe_thread_start
+
+# Keep the test run's log out of the user's real log directory.
+# Must also happen BEFORE `import mcp_ssh`: the logger is set up at import time.
+os.environ["SAFE_SSH_MCP_LOG_FILE"] = os.path.join(tempfile.mkdtemp(prefix="safe-ssh-mcp-tests-"), "test.log")
 
 import mcp_ssh  # noqa: E402  — must come after the patch above
 

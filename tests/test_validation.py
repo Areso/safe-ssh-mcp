@@ -85,7 +85,7 @@ class TestSystemdStatusValidation:
     def test_valid_daemon_nginx(self, mock_run_ssh_command):
         mcp_ssh.get_systemd_status(daemon="nginx", host="h", user="u")
         cmd = mock_run_ssh_command.call_args[0][2]
-        assert cmd == "systemctl status 'nginx'" or cmd == "systemctl status nginx"
+        assert cmd == "systemctl status -- nginx"
 
     def test_valid_daemon_with_dot(self, mock_run_ssh_command):
         mcp_ssh.get_systemd_status(daemon="sshd.service", host="h", user="u")
@@ -124,6 +124,87 @@ class TestSystemdStatusValidation:
         result = mcp_ssh.get_systemd_status(daemon="bad input!", host="h", user="u")
         assert result["ok"] is False
         assert "bad input!" in result["error"]
+
+    @pytest.mark.parametrize("daemon", [
+        "-Hroot@otherhost",      # systemctl -H: run against another host over SSH
+        "--host=root@otherhost",
+        "-a",
+        "--",
+        "-.mount",               # a real unit, given up on purpose
+    ])
+    def test_leading_dash_rejected(self, daemon, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon=daemon, host="h", user="u")
+        assert result["ok"] is False
+        assert "it starts with '-'" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("daemon", [".hidden", "_x", "@1000", ":slot"])
+    def test_other_leading_punctuation_rejected(self, daemon, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon=daemon, host="h", user="u")
+        assert result["ok"] is False
+        assert f"it starts with {daemon[0]!r}" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("daemon", [None, 123, True, ["nginx"], {"a": 1}, b"nginx"])
+    def test_non_string_rejected(self, daemon, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon=daemon, host="h", user="u")
+        assert result["ok"] is False
+        assert f"it must be a string, got {type(daemon).__name__}" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    def test_empty_string_error_message(self, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon="", host="h", user="u")
+        assert "it is empty" in result["error"]
+
+    @pytest.mark.parametrize("daemon", ["nginx\n", "nginx\n-Hroot@x", "nginx\x00", "nginx\t"])
+    def test_control_characters_rejected(self, daemon, mock_run_ssh_command):
+        """A trailing newline used to slip through: $ in a regex matches before it."""
+        result = mcp_ssh.get_systemd_status(daemon=daemon, host="h", user="u")
+        assert result["ok"] is False
+        assert "it contains" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    def test_error_lists_each_bad_character_once(self, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon="a b;c d;", host="h", user="u")
+        assert "it contains ' ', ';'." in result["error"]
+
+    def test_non_ascii_rejected(self, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon="nginxé", host="h", user="u")
+        assert result["ok"] is False
+        assert "it contains 'é'" in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    def test_longest_name_accepted(self, mock_run_ssh_command):
+        mcp_ssh.get_systemd_status(daemon="a" * mcp_ssh.SYSTEMD_UNIT_NAME_MAX, host="h", user="u")
+        mock_run_ssh_command.assert_called_once()
+
+    def test_too_long_rejected_and_not_echoed_in_full(self, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon="a" * 5000, host="h", user="u")
+        assert result["ok"] is False
+        assert "it is 5000 characters long" in result["error"]
+        assert len(result["error"]) < 400
+        mock_run_ssh_command.assert_not_called()
+
+    def test_error_states_the_rules(self, mock_run_ssh_command):
+        result = mcp_ssh.get_systemd_status(daemon="-a", host="h", user="u")
+        assert mcp_ssh.SYSTEMD_UNIT_NAME_RULES in result["error"]
+
+    @pytest.mark.parametrize("daemon", [
+        "nginx", "sshd.service", "user@1000.service", "getty@tty1.service",
+        "dbus-org.freedesktop:slot1", "systemd-journald.socket", "0day.timer", "a",
+    ])
+    def test_is_valid_systemd_unit_name_accepts(self, daemon):
+        assert mcp_ssh.is_valid_systemd_unit_name(daemon) is True
+        assert mcp_ssh.systemd_unit_name_error(daemon) is None
+
+    @pytest.mark.parametrize("daemon", ["", "-a", "a b", "a\n", None, 5, "a" * 256, "a/b", "a\\x2db"])
+    def test_is_valid_systemd_unit_name_rejects(self, daemon):
+        assert mcp_ssh.is_valid_systemd_unit_name(daemon) is False
+        assert mcp_ssh.systemd_unit_name_error(daemon).startswith("Invalid daemon name")
+
+    def test_dashes_inside_the_name_pass_after_double_dash(self, mock_run_ssh_command):
+        mcp_ssh.get_systemd_status(daemon="a--host-x", host="h", user="u")
+        assert mock_run_ssh_command.call_args[0][2] == "systemctl status -- a--host-x"
 
 
 # ============================================================

@@ -413,6 +413,36 @@ def test_libc_package_musl_prints_nothing_without_apk(tmp_path):
     assert result.stdout == ""
 
 # ============================================================
+# get_list_of_files_with_filter — the filter is a pattern, never grep options
+# ============================================================
+
+def test_list_of_files_with_filter_passes_filter_with_e(mock_run_ssh_command):
+    mcp_ssh.get_list_of_files_with_filter(host="h", user="u", abs_path="/var/log", filter="syslog")
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert cmd == "ls /var/log -lah | grep -e syslog "
+
+
+def test_list_of_files_with_filter_dash_filter_is_not_grep_options(mock_run_ssh_command, tmp_path):
+    """A filter like -rne. must not make grep recurse and print file contents."""
+    listed = tmp_path / "listed"
+    listed.mkdir()
+    (listed / "-rne.txt").write_text("")
+    (listed / "other.txt").write_text("")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("SECRET=planted\n")
+
+    mcp_ssh.get_list_of_files_with_filter(host="h", user="u", abs_path=str(listed), filter="-rne.")
+    cmd = mock_run_ssh_command.call_args[0][2]
+    # GNU-style option order (ls PATH -lah) is not accepted by BSD ls on macOS
+    cmd = cmd.replace(f"ls {listed} -lah", f"ls -lah {listed}")
+    result = subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True, cwd=home)
+
+    assert "SECRET" not in result.stdout
+    assert "-rne.txt" in result.stdout
+    assert "other.txt" not in result.stdout
+
+# ============================================================
 # get_hostname — uname -n with fallbacks, optional FQDN
 # ============================================================
 

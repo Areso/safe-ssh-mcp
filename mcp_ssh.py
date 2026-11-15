@@ -17,6 +17,7 @@ import sys
 import re
 import shlex
 import logging
+from logging.handlers import RotatingFileHandler
 import ipaddress
 
 import paramiko
@@ -58,11 +59,67 @@ def _setup_dev_logger() -> Optional[logging.Logger]:
     dev_logger.handlers = [h for h in dev_logger.handlers if isinstance(h, logging.FileHandler)]
     return dev_logger
 
+LOG_DIR_NAME = "safe-ssh-mcp"
+LOG_FILE_NAME = "safe-ssh-mcp.log"
+# The log is rotated: at most LOG_MAX_BYTES in the current file plus LOG_BACKUP_COUNT old ones
+LOG_MAX_BYTES = 5_000_000
+LOG_BACKUP_COUNT = 3
+
+def default_log_path(
+    platform: str = sys.platform,
+    environ: Optional[Dict[str, str]] = None,
+    home: Optional[str] = None,
+) -> str:
+    """
+    Returns the default log file path: an absolute path in the user's own log directory,
+    so it does not depend on the directory the MCP client started the server in.
+      Linux and others: $XDG_STATE_HOME/safe-ssh-mcp/ or ~/.local/state/safe-ssh-mcp/
+      macOS:            ~/Library/Logs/safe-ssh-mcp/
+      Windows:          %LOCALAPPDATA%/safe-ssh-mcp/Logs/
+    """
+    environ = os.environ if environ is None else environ
+    home = os.path.expanduser("~") if home is None else home
+    if platform == "darwin":
+        log_dir = os.path.join(home, "Library", "Logs", LOG_DIR_NAME)
+    elif platform.startswith("win"):
+        base = environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        log_dir = os.path.join(base, LOG_DIR_NAME, "Logs")
+    else:
+        base = environ.get("XDG_STATE_HOME", "")
+        # the XDG spec says a relative path here is invalid and must be ignored
+        if not os.path.isabs(base):
+            base = os.path.join(home, ".local", "state")
+        log_dir = os.path.join(base, LOG_DIR_NAME)
+    return os.path.join(log_dir, LOG_FILE_NAME)
+
+def open_log_handler(path: str) -> Optional[logging.Handler]:
+    """
+    Opens the rotating log file, creating its directory (owner-only) when it is missing.
+    Returns None when that fails, after saying why on stderr: a log that cannot be
+    written must not stop the server from starting. stderr is safe, stdout carries MCP.
+    """
+    try:
+        log_dir = os.path.dirname(path)
+        if log_dir:
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        return RotatingFileHandler(
+            path, mode="a", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+        )
+    except OSError as e:
+        print(
+            f"safe-ssh-mcp: cannot write the log file {path!r} ({e}); logging is off. "
+            "Set SAFE_SSH_MCP_LOG_FILE to a writable path to turn it on.",
+            file=sys.stderr,
+        )
+        return None
+
 def setup_logger(
-    path: str = "safe-ssh-mcp.log",
-    level: int = logging.DEBUG,
+    path: Optional[str] = None,
+    level: int = logging.INFO,
 ) -> logging.Logger:
-    """Configure a JSON file logger. Path/level are configurable via env vars.
+    """Configure a JSON file logger. Path/level are configurable via env vars
+    (SAFE_SSH_MCP_LOG_FILE, SAFE_SSH_MCP_LOG_LEVEL); the default path is
+    default_log_path() and the default level is INFO.
 
     By default this uses a dependency-free stdlib logger. Set
     SAFE_SSH_MCP_DEV_LOGGER=1 (with the `dev` extra installed) to opt into the
@@ -72,16 +129,19 @@ def setup_logger(
         dev_logger.propagate = False
         return dev_logger
 
-    path = os.environ.get("SAFE_SSH_MCP_LOG_FILE", path)
+    path = os.environ.get("SAFE_SSH_MCP_LOG_FILE") or path or default_log_path()
     env_level = os.environ.get("SAFE_SSH_MCP_LOG_LEVEL")
     if env_level:
         level = getattr(logging, env_level.upper(), level)
 
     logger_c = logging.getLogger("safe-ssh-mcp")
     if not logger_c.handlers:
-        file_handler = logging.FileHandler(path, mode="a")
-        file_handler.setFormatter(JSONFormatter())
-        logger_c.addHandler(file_handler)
+        handler = open_log_handler(path)
+        if handler is None:
+            handler = logging.NullHandler()
+        else:
+            handler.setFormatter(JSONFormatter())
+        logger_c.addHandler(handler)
         logger_c.setLevel(level)
     logger_c.propagate = False
     return logger_c
@@ -313,6 +373,7 @@ def _run_cmd(client: paramiko.SSHClient, cmd: str, timeout_s: int = 20) -> Dict[
     # Read the output BEFORE waiting for the exit status: once the unread output fills the
     # SSH window (about 2 MB) the remote command blocks, and waiting for its exit status
     # first would hang until the timeout and return cut-off output.
+    # stderr is read only after stdout has ended: see decision_records/run_cmd_output_reading.md
     out = stdout.read().decode(errors="replace").strip()
     err = stderr.read().decode(errors="replace").strip()
     result = {
@@ -735,6 +796,41 @@ def is_valid_coredump_command(command: Any) -> bool:
     """Checks that the value is one of the coredumpctl commands in the closed list."""
     return isinstance(command, str) and command in COREDUMP_COMMANDS
 
+# systemd's own limit on a unit name (UNIT_NAME_MAX is 256 including the terminator)
+SYSTEMD_UNIT_NAME_MAX = 255
+SYSTEMD_UNIT_NAME_SHOWN_MAX = 60
+SYSTEMD_UNIT_NAME_PATTERN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9.\-_@:]*")
+SYSTEMD_UNIT_NAME_RULES = (
+    "Allowed: ASCII letters, digits and . - _ @ : , starting with a letter or digit, "
+    f"at most {SYSTEMD_UNIT_NAME_MAX} characters (e.g. nginx, sshd.service, user@1000.service)."
+)
+
+def systemd_unit_name_error(name: Any) -> Optional[str]:
+    """
+    Says what is wrong with a systemd unit name, or returns None when it is valid.
+    A name may not start with '-' (systemctl would read it as an option, e.g.
+    -H user@host), so the units '-.mount' and '-.slice' cannot be asked for.
+    """
+    if not isinstance(name, str):
+        return f"Invalid daemon name: it must be a string, got {type(name).__name__}. {SYSTEMD_UNIT_NAME_RULES}"
+    if name == "":
+        return f"Invalid daemon name: it is empty. {SYSTEMD_UNIT_NAME_RULES}"
+    # the name is echoed back cut short, so a huge input does not make a huge error
+    shown = repr(name[:SYSTEMD_UNIT_NAME_SHOWN_MAX]) + ("..." if len(name) > SYSTEMD_UNIT_NAME_SHOWN_MAX else "")
+    if len(name) > SYSTEMD_UNIT_NAME_MAX:
+        return f"Invalid daemon name {shown}: it is {len(name)} characters long. {SYSTEMD_UNIT_NAME_RULES}"
+    if not re.fullmatch(r"[a-zA-Z0-9]", name[0]):
+        return f"Invalid daemon name {shown}: it starts with {name[0]!r}. {SYSTEMD_UNIT_NAME_RULES}"
+    if not SYSTEMD_UNIT_NAME_PATTERN.fullmatch(name):
+        bad = sorted(set(re.sub(r"[a-zA-Z0-9.\-_@:]", "", name)))
+        return (f"Invalid daemon name {shown}: it contains {', '.join(repr(c) for c in bad)}. "
+                f"{SYSTEMD_UNIT_NAME_RULES}")
+    return None
+
+def is_valid_systemd_unit_name(name: Any) -> bool:
+    """Checks that the value is a systemd unit name systemctl cannot read as an option."""
+    return systemd_unit_name_error(name) is None
+
 # Finds how to become root without a password prompt: nothing when already root, else
 # `sudo -n` or `doas -n` (Alpine), whichever the host has. -n makes them fail at once
 # instead of waiting for a password. With neither, the command runs as the login user.
@@ -958,7 +1054,9 @@ def get_list_of_files_with_filter(
         return {"ok": False, "error": "Filter contains forbidden characters |&;<>()$`{}"}
     quoted_filter = shlex.quote(filter)
 
-    cmd = f"ls {quoted_path} -lah | grep {quoted_filter} "
+    # -e: the filter is always the pattern, even when it starts with "-" (otherwise
+    # grep reads it as options, e.g. -r, and prints file contents)
+    cmd = f"ls {quoted_path} -lah | grep -e {quoted_filter} "
     result = run_ssh_command(
         host, user, cmd, port, password, key_path, timeout, accept_new_hostkey,
         success_exit_codes=(0, 1) # du may return 1 on partial permission denied
@@ -1443,13 +1541,15 @@ def get_systemd_status(
 ) -> Dict[str, Any]:
     """
     Gets the detailed status, logs, and error messages for a SPECIFIC systemd daemon/service/unit.
+    daemon is a unit name such as nginx, sshd.service or user@1000.service: ASCII letters,
+    digits and . - _ @ : only, starting with a letter or digit, at most 255 characters.
     """
-    VALID_DAEMON_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_@:]+$")
-    if not VALID_DAEMON_PATTERN.match(daemon):
-        return {"ok": False, 
-                "error": f"Invalid daemon name: '{daemon}'. Only ASCII alphanumeric characters, '.', '-', '_', '@', and ':' are allowed."}
-    safe_daemon = shlex.quote(daemon)
-    cmd = f"systemctl status {safe_daemon}"
+    error = systemd_unit_name_error(daemon)
+    if error:
+        logger.error(f"get_systemd_status tool: {error}")
+        return {"ok": False, "error": error}
+    # --: whatever follows is a unit name, never a systemctl option
+    cmd = f"systemctl status -- {shlex.quote(daemon)}"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 # BusyBox ps (Alpine) has neither `aux --sort` nor %cpu/%mem columns, so each tool tries
