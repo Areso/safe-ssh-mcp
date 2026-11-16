@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
+## 0.2.2 - 2026-11-17
+### Changed
+- `get_installed_packages` on rpm hosts (RHEL, CentOS, Fedora, SUSE) prints tab-separated
+  package, epoch, version, release, architecture and source RPM, as the dpkg and apk
+  branches already do, instead of plain `rpm -qa` (`name-version-release.arch`). The
+  header line is now `# rpm, tab-separated: package epoch version release architecture
+  source_rpm`. A package without an epoch gets `0`. Imported GPG keys (`gpg-pubkey`)
+  are no longer listed. **Breaking** for anything that parsed the old rpm listing.
+- `get_top` takes two samples 1 second apart and returns the second one
+  (`top -b -n 2 -d 1 -c -w 512`), so CPU usage is the current one and not the average
+  since boot. Lines are up to 512 columns wide instead of 80, and the output is cut to
+  the first 30 lines (the summary and the top CPU consumers). The call takes about
+  1 second longer. The BusyBox fallback is cut to 30 lines too, and a failure of
+  BusyBox top is no longer hidden. `busybox_fallback` got an
+  optional `output_filter` for this.
+
 ## 0.2.1 - 2026-11-14
 ### Added
 - Shared validator `is_valid_systemd_unit_name` / `systemd_unit_name_error`.

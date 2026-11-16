@@ -19,7 +19,7 @@ A few examples from each group; `<...>` marks a validated parameter.
 - get_mounts : `findmnt` (or `cat /proc/mounts`)
 
 **CPU, memory and processes**
-- get_top : `top -b -n 1 -c`
+- get_top : `top -b -n 2 -d 1 -c -w 512`, second sample, first 30 lines
 - get_vmstat : `vmstat 1 5`
 - get_pressure : `cat /proc/pressure/{cpu,io,memory}`
 
@@ -47,7 +47,7 @@ A few examples from each group; `<...>` marks a validated parameter.
 
 **System, logins and crashes**
 - get_distroname_version : `cat /etc/os-release`
-- get_installed_packages : `dpkg-query -W` (with source package), `rpm -qa` or `/lib/apk/db/installed` (with origin)
+- get_installed_packages : `dpkg-query -W` (with source package), `rpm -qa --qf` (with epoch and source RPM) or `/lib/apk/db/installed` (with origin)
 - get_failed_logins : `lastb -F -n <lines>`
 - get_coredumps : `coredumpctl list --no-pager`
 

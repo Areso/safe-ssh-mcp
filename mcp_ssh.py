@@ -879,15 +879,20 @@ def docker_cmd(args: str) -> str:
     """
     return f"{DOCKER_PREFIX}$DOCKER {args}"
 
-def busybox_fallback(cmd: str, program: str, fallback_cmd: str) -> str:
+def busybox_fallback(cmd: str, program: str, fallback_cmd: str, output_filter: Optional[str] = None) -> str:
     """Runs cmd; if it fails AND program is the BusyBox one (Alpine), runs fallback_cmd instead.
     BusyBox programs lack many options of their procps / util-linux namesakes.
     A failure on a non-BusyBox host is passed through unchanged: same output on stderr,
     same exit code. cmd must be a single simple command (no pipes).
+
+    output_filter, if given, is a pipeline the output of a successful cmd is piped through;
+    it runs after cmd's exit code is checked, so it cannot mask a failure.
+    It is not applied to fallback_cmd.
     """
+    filter_part = f" | {output_filter}" if output_filter else ""
     return (
         f"out=$({cmd} 2>&1); rc=$?; "
-        """if [ "$rc" -eq 0 ]; then printf '%s\\n' "$out"; """
+        f"""if [ "$rc" -eq 0 ]; then printf '%s\\n' "$out"{filter_part}; """
         f"elif {program} --help 2>&1 | grep -q BusyBox; then {fallback_cmd}; "
         """else printf '%s\\n' "$out" >&2; exit "$rc"; fi"""
     )
@@ -1216,6 +1221,16 @@ APK_DB_TO_TSV = (
 )
 APK_HEADER = "# apk, tab-separated: package version architecture origin"
 
+# `rpm -qa` prints name-version-release.arch, which cannot be split reliably and has neither
+# the epoch nor the source RPM. Version comparison is wrong without the epoch (1:1.0 is newer
+# than 2.0), and the source RPM links a binary package to its advisories
+# (openssh-server -> openssh). A package without an epoch gets 0, not rpm's '(none)'.
+RPM_FORMAT = r"%{NAME}\t%|EPOCH?{%{EPOCH}}:{0}|\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\n"
+# Imported GPG keys are listed as gpg-pubkey pseudo-packages (rpm before 6.0); they are not software.
+RPM_PACKAGES_FILTER = r"""awk -F'\t' '$1 != "gpg-pubkey"'"""
+RPM_LIST_INSTALLED = f"rpm -qa --qf '{RPM_FORMAT}' | {RPM_PACKAGES_FILTER}"
+RPM_HEADER = "# rpm, tab-separated: package epoch version release architecture source_rpm"
+
 @mcp.tool()
 def get_installed_packages(
     host: str,
@@ -1234,15 +1249,18 @@ def get_installed_packages(
       'hi' installed and held), source_package, source_version. Security advisories for
       Debian/Ubuntu are keyed by SOURCE package (openssh, not openssh-server).
       Removed packages whose config files are left behind (state 'rc') are not listed.
-    rpm (RHEL/Fedora/SUSE): name-version-release.arch, as printed by rpm -qa.
+    rpm (RHEL/Fedora/SUSE), tab-separated: package, epoch (0 if the package has none), version,
+      release, architecture, source_rpm (file name of the source RPM, e.g.
+      openssh-8.7p1-38.el9.src.rpm for openssh-server). Compare versions as epoch:version-release.
+      Imported GPG keys (gpg-pubkey) are not listed.
     apk (Alpine), tab-separated: package, version, architecture, origin. Security advisories for
       Alpine are keyed by ORIGIN (openssl, not libcrypto3); it has the same version as the package.
     """
     cmd = (
-        # pipefail keeps dpkg-query's exit code, which awk would otherwise mask
+        # pipefail keeps the exit code of dpkg-query and rpm, which awk would otherwise mask
         "set -o pipefail; if command -v dpkg-query >/dev/null 2>&1; then "
         f"echo {shlex.quote(DPKG_HEADER)}; {DPKG_LIST_INSTALLED}; "
-        "elif command -v rpm >/dev/null 2>&1; then echo '# rpm: name-version-release.arch'; rpm -qa; "
+        f"elif command -v rpm >/dev/null 2>&1; then echo {shlex.quote(RPM_HEADER)}; {RPM_LIST_INSTALLED}; "
         f"elif [ -r {APK_DB_PATH} ]; then echo {shlex.quote(APK_HEADER)}; {APK_DB_TO_TSV} {APK_DB_PATH}; "
         "elif command -v apk >/dev/null 2>&1; then echo '# apk: name-version'; apk info -v; "
         "else echo 'No supported package manager found (dpkg, rpm, apk)' >&2; exit 127; fi"
@@ -1714,6 +1732,13 @@ def get_vmstat(
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 BUSYBOX_TOP_HEADER = "# BusyBox: top -b -n 1"
+# captured, not piped, so that a failing top is noticed; with the header line it is 30 lines
+BUSYBOX_TOP_CMD = (
+    "out=$(top -b -n 1) || exit $?; "
+    f"""echo {shlex.quote(BUSYBOX_TOP_HEADER)}; printf '%s\\n' "$out" | awk 'NR <= 29'"""
+)
+# every sample of procps top starts with a "top - ..." line; keep the second sample only
+TOP_SECOND_SAMPLE_FILTER = "awk '/^top -/{n++} n==2' | head -n 30"
 
 @mcp.tool()
 def get_top(
@@ -1726,15 +1751,17 @@ def get_top(
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
-    Collects top's snapshot from a remote Linux host via SSH (top -b -n 1 -c).
-    On BusyBox hosts (Alpine), where top has no -c, the output is plain `top -b -n 1`:
-    its first line starts with '# BusyBox' and the columns differ.
+    Collects top's snapshot from a remote Linux host via SSH (top -b -n 2 -d 1 -c -w 512).
+    Takes two samples 1 second apart and returns the second one, so CPU usage is the current one
+    (the first sample of top shows averages since boot). The output is cut to the first 30 lines:
+    the summary and the top CPU consumers.
+    On BusyBox hosts (Alpine), where top has no -c / -w, the output is plain `top -b -n 1`,
+    cut to 30 lines too: its first line starts with '# BusyBox' and the columns differ.
     """
-    # top -b -n 1
-    # top -b -n 1 -c
-    # top -b -d 1 -n 1
-    # top -b -n 1 -u youruser
-    cmd = busybox_fallback("top -b -n 1 -c", "top", f"echo {shlex.quote(BUSYBOX_TOP_HEADER)}; top -b -n 1")
+    cmd = busybox_fallback(
+        "top -b -n 2 -d 1 -c -w 512", "top", BUSYBOX_TOP_CMD,
+        output_filter=TOP_SECOND_SAMPLE_FILTER,
+    )
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()

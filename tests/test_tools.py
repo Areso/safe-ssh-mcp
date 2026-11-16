@@ -48,8 +48,10 @@ import mcp_ssh
     (mcp_ssh.get_mounts, "if command -v findmnt >/dev/null 2>&1; then findmnt; else cat /proc/mounts; fi"),
     (
         mcp_ssh.get_top,
-        """out=$(top -b -n 1 -c 2>&1); rc=$?; if [ "$rc" -eq 0 ]; then printf '%s\\n' "$out"; """
-        "elif top --help 2>&1 | grep -q BusyBox; then echo '# BusyBox: top -b -n 1'; top -b -n 1; "
+        """out=$(top -b -n 2 -d 1 -c -w 512 2>&1); rc=$?; if [ "$rc" -eq 0 ]; then printf '%s\\n' "$out" """
+        """| awk '/^top -/{n++} n==2' | head -n 30; """
+        "elif top --help 2>&1 | grep -q BusyBox; then out=$(top -b -n 1) || exit $?; "
+        """echo '# BusyBox: top -b -n 1'; printf '%s\\n' "$out" | awk 'NR <= 29'; """
         """else printf '%s\\n' "$out" >&2; exit "$rc"; fi""",
     ),
     (mcp_ssh.get_lsblk, "lsblk"),
@@ -805,6 +807,97 @@ def test_busybox_fallback_passes_real_failure_through(tmp_path):
     assert (res.returncode, res.stdout, res.stderr) == (3, "", "tool: real failure\n")
 
 
+def test_busybox_fallback_applies_output_filter_to_normal_output(tmp_path):
+    cmd = mcp_ssh.busybox_fallback("tool -x", "tool", "echo fallback", output_filter="tr a-z A-Z")
+    res = run_with_fake_bin(tmp_path, cmd, {"tool": FAKE_FULL_TOOL})
+    assert (res.returncode, res.stdout, res.stderr) == (0, "FULL OUTPUT -X\n", "")
+
+
+def test_busybox_fallback_output_filter_does_not_mask_failure(tmp_path):
+    cmd = mcp_ssh.busybox_fallback("tool --bad", "tool", "echo fallback", output_filter="head -n 1")
+    res = run_with_fake_bin(tmp_path, cmd, {"tool": FAKE_FULL_TOOL})
+    assert (res.returncode, res.stdout, res.stderr) == (3, "", "tool: real failure\n")
+
+
+def test_busybox_fallback_output_filter_is_not_applied_to_fallback(tmp_path):
+    cmd = mcp_ssh.busybox_fallback("tool -x", "tool", "echo '# BusyBox'; tool", output_filter="head -n 1")
+    res = run_with_fake_bin(tmp_path, cmd, {"tool": FAKE_BUSYBOX_TOOL})
+    assert res.returncode == 0
+    assert res.stdout.splitlines() == ["# BusyBox", "HEADER", "row0", "row1", "row2", "row3", "row4"]
+
+
+# ============================================================
+# get_top — second sample of procps top, run in local bash with a fake top
+# ============================================================
+
+# two samples; the second one is long enough to be cut by head
+PROCPS_TOP = """#!/bin/sh
+case "$*" in
+  "-b -n 2 -d 1 -c -w 512") ;;
+  *) echo "top: unexpected arguments: $*" >&2; exit 1 ;;
+esac
+for sample in 1 2; do
+  echo "top - 10:00:0$sample up 1 day,  1 user,  load average: 0.00, 0.00, 0.00"
+  echo "%Cpu(s): sample $sample"
+  echo ""
+  echo "    PID USER      %CPU COMMAND"
+  i=0; while [ $i -lt 3000 ]; do echo "  $i root 0.0 sample$sample proc$i"; i=$((i+1)); done
+  echo ""
+done
+"""
+
+
+def get_top_cmd(mock_run_ssh_command):
+    mcp_ssh.get_top(host="h", user="u")
+    return mock_run_ssh_command.call_args[0][2]
+
+
+def test_get_top_returns_second_sample_cut_to_30_lines(tmp_path, mock_run_ssh_command):
+    res = run_with_fake_bin(tmp_path, get_top_cmd(mock_run_ssh_command), {"top": PROCPS_TOP})
+    assert res.returncode == 0
+    lines = res.stdout.splitlines()
+    assert len(lines) == 30
+    assert lines[0].startswith("top - 10:00:02")
+    assert lines[1] == "%Cpu(s): sample 2"
+    assert lines[4] == "  0 root 0.0 sample2 proc0"
+    assert not any("sample1" in line or "sample 1" in line for line in lines)
+
+
+def test_get_top_falls_back_to_busybox_top(tmp_path, mock_run_ssh_command):
+    busybox_top = """#!/bin/sh
+case "$*" in
+  --help) echo "BusyBox v1.37.0 multi-call binary." >&2; exit 1 ;;
+  "-b -n 1")
+    echo "Mem: 142504K used"; echo "  PID  PPID USER     STAT   VSZ %VSZ CPU %CPU COMMAND"
+    echo "  9 1 root S 1636 0% 0 0% $(printf '%0300d' 0)"
+    i=0; while [ $i -lt 3000 ]; do echo "  $i 1 root S 1636 0% 0 0% proc$i"; i=$((i+1)); done ;;
+  *) echo "top: unrecognized option: c" >&2; exit 1 ;;
+esac
+"""
+    res = run_with_fake_bin(tmp_path, get_top_cmd(mock_run_ssh_command), {"top": busybox_top})
+    assert res.returncode == 0
+    lines = res.stdout.splitlines()
+    assert len(lines) == 30
+    assert lines[:4] == [
+        "# BusyBox: top -b -n 1",
+        "Mem: 142504K used",
+        "  PID  PPID USER     STAT   VSZ %VSZ CPU %CPU COMMAND",
+        "  9 1 root S 1636 0% 0 0% " + "0" * 300,
+    ]
+    assert lines[4] == "  0 1 root S 1636 0% 0 0% proc0"
+
+
+def test_get_top_reports_failure_when_busybox_top_also_fails(tmp_path, mock_run_ssh_command):
+    failing_top = """#!/bin/sh
+case "$*" in
+  --help) echo "BusyBox v1.37.0 multi-call binary." >&2; exit 1 ;;
+  *) echo "top: broken" >&2; exit 4 ;;
+esac
+"""
+    res = run_with_fake_bin(tmp_path, get_top_cmd(mock_run_ssh_command), {"top": failing_top})
+    assert (res.returncode, res.stdout, res.stderr) == (4, "", "top: broken\n")
+
+
 # ============================================================
 # as_root — sudo -n / doas -n for the few tools that need root
 # ============================================================
@@ -1321,6 +1414,17 @@ def test_installed_packages_apk_reads_database_for_origin(mock_run_ssh_command):
     assert cmd.index("/lib/apk/db/installed") < cmd.index("apk info -v")
 
 
+def test_installed_packages_rpm_command(mock_run_ssh_command):
+    mcp_ssh.get_installed_packages(host="h", user="u")
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert (
+        "elif command -v rpm >/dev/null 2>&1; then "
+        "echo '# rpm, tab-separated: package epoch version release architecture source_rpm'; "
+        r"rpm -qa --qf '%{NAME}\t%|EPOCH?{%{EPOCH}}:{0}|\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\n' | "
+        r"""awk -F'\t' '$1 != "gpg-pubkey"'; elif"""
+    ) in cmd
+
+
 needs_bash_and_awk = pytest.mark.skipif(
     shutil.which("bash") is None or shutil.which("awk") is None, reason="needs bash and awk"
 )
@@ -1344,6 +1448,22 @@ def test_dpkg_installed_filter_drops_removed_packages():
     )
     assert result.returncode == 0
     assert result.stdout.splitlines() == [rows[0], rows[2], rows[6], rows[7]]
+
+
+@needs_bash_and_awk
+def test_rpm_packages_filter_drops_gpg_keys():
+    rows = [
+        "openssh-server\t0\t8.7p1\t38.el9\tx86_64\topenssh-8.7p1-38.el9.src.rpm",
+        "gpg-pubkey\t0\t8483c65d\t5ccc5b19\t(none)\t(none)",
+        "vim-data\t2\t9.1.083\t25.el10\tnoarch\tvim-9.1.083-25.el10.src.rpm",
+        "gpg-pubkey-release\t0\t1.0\t1\tnoarch\tgpg-pubkey-release-1.0-1.src.rpm",  # a real package
+    ]
+    result = subprocess.run(
+        ["bash", "-c", mcp_ssh.RPM_PACKAGES_FILTER],
+        input="\n".join(rows) + "\n", capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [rows[0], rows[2], rows[3]]
 
 
 APK_DB_SAMPLE = """C:Q1abcdefghijklmnopqrstuvwxyz0=
