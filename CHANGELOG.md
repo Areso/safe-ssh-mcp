@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
+## 0.2.3 - 2026-11-17
+### Added
+- `get_process_files`: for every running process, its executable and the shared libraries
+  it has loaded (`/proc/<pid>/maps`), followed by the package that owns each of those
+  files (dpkg, rpm or apk). Answers "which services really use this library" and "which
+  processes still run code an upgrade has replaced". The `/proc` part runs through
+  `sudo -n` / `doas -n` when the login user is not root and falls back to the login
+  user's own processes, with a `# not run as root` first line, if that is refused. See
+  [decision_records/as_root.md](decision_records/as_root.md).
+
 ## 0.2.2 - 2026-11-17
 ### Changed
 - `get_installed_packages` on rpm hosts (RHEL, CentOS, Fedora, SUSE) prints tab-separated

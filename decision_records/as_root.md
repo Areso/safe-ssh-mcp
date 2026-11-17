@@ -13,6 +13,8 @@ These tools run their command as root when the login user is not root:
   docker daemon (added 2026-11-12, see "Docker tools" below);
 - `get_listening_sockets` — always, but falls back to the login user if escalation is
   refused (added 2026-11-12, see "Tools that fall back" below).
+- `get_process_files` — the same, for its `/proc` part only (added 2026-11-17, see
+  "Tools that fall back" below).
 
 The helper `as_root` picks, on the remote host:
 
@@ -92,6 +94,26 @@ The sudo/doas refusal itself is not shown. Commands for the admin's rule:
 ss -tulpn
 netstat -tulnp
 ```
+
+`get_process_files` (added 2026-11-17) does the same. Any user can read `/proc/<pid>/exe`
+and `/proc/<pid>/maps` of their own processes; root can read everyone's. Only that
+loop is escalated, as `sh -c '<fixed script>'`. The second half of the tool, asking the
+package database who owns the files, runs as the login user: it needs no root. The
+fallback line is:
+
+```
+# not run as root (no sudo -n / doas -n access): only the login user's own processes are listed
+```
+
+For the admin's rule this is the weak spot of the list: the command is `sh -c` with a
+long script as its argument, which a sudoers rule can only match in full (copy it from
+`PROCESS_FILES_PROC_SCRIPT` in `mcp_ssh.py`) and which changes if the script changes.
+Allowing plain `sh` would allow everything. A host that already gives the login user
+unrestricted `sudo -n` / `doas -n` (the usual cloud image setup) needs nothing.
+
+The alternative, a fixed list of commands such as `cat /proc/*/maps`, was rejected:
+the shell expands the glob before sudo sees it, so the rule would have to allow `cat`
+on any path, which is worse.
 
 ## Limits
 

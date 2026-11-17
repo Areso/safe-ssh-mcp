@@ -2271,6 +2271,85 @@ def get_listening_sockets(
     cmd = LISTENING_SOCKETS_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+# Step 1, the only part that needs root: for every process whose /proc entry can be read,
+# a "P <pid> <name> <executable>" line and an "F <file>" line per file it has mapped as
+# executable code (its shared libraries). Kernel threads have no executable and are skipped,
+# as is a process that exits half-way. A file replaced by an upgrade is shown without the
+# kernel's " (deleted)" mark: the process still runs the old code, under the same path.
+PROCESS_FILES_PROC_SCRIPT = r"""for d in /proc/[0-9]*; do
+exe=$(readlink "$d/exe" 2>/dev/null) && [ -n "$exe" ] || continue
+read -r comm 2>/dev/null < "$d/comm" || continue
+files=$(awk '$2 ~ /x/ && index($0, "/") { p = substr($0, index($0, "/")); sub(/ \(deleted\)$/, "", p); if (!seen[p]++) print "F\t" p }' "$d/maps" 2>/dev/null) || continue
+printf 'P\t%s\t%s\t%s\n' "${d#/proc/}" "$comm" "${exe% (deleted)}"
+[ -z "$files" ] || printf '%s\n' "$files"
+done"""
+PROCESS_FILES_PLAIN_NOTE = (
+    "# not run as root (no sudo -n / doas -n access): "
+    "only the login user's own processes are listed"
+)
+# Step 2: every distinct file of step 1, in both spellings of a merged /usr (the kernel
+# says /usr/lib/x where the package database may say /lib/x, or the other way round).
+PROCESS_FILES_PATHS = (
+    r"""awk -F'\t' '{ p = ($1 == "P") ? $4 : $2 } p == "" || seen[p]++ { next } { print p } """
+    r"""p ~ /^\/usr\/(s?bin|lib[^\/]*)\// { print substr(p, 5) } """
+    r"""p ~ /^\/(s?bin|lib[^\/]*)\// { print "/usr" p }'"""
+)
+# Keeps the "package<TAB>file" lines (after the "#" line) whose file is in the list before it.
+PROCESS_FILES_OWNED = r"""awk -F'\t' '!listed { if ($0 == "#") listed = 1; else want[$0]; next } $2 in want'"""
+# apk has no fast "who owns these files": the installed database lists them per package
+# (P: package, F: directory, R: file name).
+APK_DB_FILES = (
+    """awk '/^P:/ { p = substr($0, 3) } /^F:/ { d = substr($0, 3) } """
+    f"""/^R:/ {{ print p "\\t/" d "/" substr($0, 3) }}' {APK_DB_PATH}"""
+)
+PROCESS_FILES_CMD = (
+    f"PROC={shlex.quote(PROCESS_FILES_PROC_SCRIPT)}; "
+    f"""out=$({as_root_or_plain('sh -c "$PROC"', PROCESS_FILES_PLAIN_NOTE)}) || exit; """
+    """printf '%s\\n' "$out"; """
+    f"""paths=$(printf '%s\\n' "$out" | {PROCESS_FILES_PATHS}); """
+    # dpkg-query -S exits 1 when one of the files has no owner; the others are still printed
+    "if command -v dpkg-query >/dev/null 2>&1; then echo '# owners: dpkg-query -S'; "
+    """printf '%s\\n' "$paths" | xargs -d '\\n' dpkg-query -S 2>/dev/null; true; """
+    "elif command -v rpm >/dev/null 2>&1; then echo '# owners: package, file'; "
+    """{ printf '%s\\n#\\n' "$paths"; rpm -qa --qf '[%{=NAME}\\t%{FILENAMES}\\n]'; } | """
+    f"{PROCESS_FILES_OWNED}; "
+    f"elif [ -r {APK_DB_PATH} ]; then echo '# owners: package, file'; "
+    f"""{{ printf '%s\\n#\\n' "$paths"; {APK_DB_FILES}; }} | {PROCESS_FILES_OWNED}; """
+    "else echo '# owners: unknown (no dpkg, rpm or apk package database)'; fi"
+)
+
+@mcp.tool()
+def get_process_files(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Shows which packages' code every running process executes on a remote Linux host via
+    SSH: its executable, the shared libraries it has loaded, and the package that owns each
+    of those files. USE THIS TOOL to find which services really use a library (e.g. is the
+    vulnerable libssl loaded by anything that listens on the network?) and which processes
+    still run a binary or library that was replaced by an upgrade and need a restart.
+    Combine the pids with get_listening_sockets.
+    The output has two parts, tab-separated:
+    1. Per process a line "P <pid> <name> <executable>", followed by one line "F <file>"
+       for every file it has mapped as executable code (read from /proc/<pid>/maps).
+    2. After a line starting with "# owners": the package of each of those files.
+       rpm and apk: "<package> <file>". dpkg: "<package>[:arch][, <package>...]: <file>",
+       as printed by dpkg-query -S. A file missing here belongs to no package. With a merged
+       /usr a file may be listed as /lib/... or /bin/... where part 1 says /usr/lib/... or
+       /usr/bin/..., or the other way round.
+    If the login user is not root, part 1 runs through sudo -n / doas -n to see all
+    processes; if that is not allowed, it runs as the login user and says so in a
+    "# not run as root" first line (only that user's own processes are then listed).
+    """
+    cmd = PROCESS_FILES_CMD
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
 @mcp.tool()
 def get_ip_addr(
     host: str,

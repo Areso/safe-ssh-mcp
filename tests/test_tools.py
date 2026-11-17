@@ -1,4 +1,5 @@
 """Tests that every MCP tool handler passes the correct command to run_ssh_command."""
+import os
 import shutil
 import subprocess
 
@@ -59,6 +60,7 @@ import mcp_ssh
     (mcp_ssh.get_docker_images, mcp_ssh.DOCKER_PREFIX + "$DOCKER images --digests"),
     (mcp_ssh.get_crontab_tasks, "crontab -l"),
     (mcp_ssh.get_listening_sockets, mcp_ssh.LISTENING_SOCKETS_CMD),
+    (mcp_ssh.get_process_files, mcp_ssh.PROCESS_FILES_CMD),
 ])
 def test_simple_tool_sends_correct_command(tool_func, expected_cmd, mock_run_ssh_command):
     tool_func(host="testhost", user="testuser")
@@ -516,6 +518,108 @@ def test_hostname_nothing_works(tmp_path):
     assert result.returncode == 1
     assert result.stdout == ""
     assert "could not read the hostname" in result.stderr
+
+# ============================================================
+# get_process_files — /proc maps, then the owning packages
+# ============================================================
+
+PROCESS_FILES_TOOLS = ("sh", "awk", "readlink", "xargs", "true")
+
+
+def _run_process_files_cmd(tmp_path, programs, uid="0"):
+    """Runs the command against the real /proc, with the given fake programs (name -> script
+    body) and the few real tools the script needs on PATH."""
+    for name in PROCESS_FILES_TOOLS:
+        (tmp_path / name).symlink_to(shutil.which(name))
+    programs = {"id": f"echo {uid}", **programs}
+    for name, body in programs.items():
+        f = tmp_path / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    return subprocess.run(
+        ["/bin/bash", "-c", mcp_ssh.PROCESS_FILES_CMD], capture_output=True, text=True,
+        env={"PATH": str(tmp_path)},
+    )
+
+
+needs_proc = pytest.mark.skipif(not os.path.exists("/proc/self/maps"), reason="needs Linux /proc")
+# Fake `sudo -n sh -c SCRIPT`: says so, then really runs the script.
+SUDO_RUNS = 'shift; echo "# via sudo"; exec "$@"'
+PROCESS_FILES_NOTE = mcp_ssh.PROCESS_FILES_PLAIN_NOTE + "\n"
+
+
+def _parts(stdout):
+    """(lines before the '# owners' line, that line, lines after it)."""
+    lines = stdout.splitlines()
+    split = next(i for i, line in enumerate(lines) if line.startswith("# owners"))
+    return lines[:split], lines[split], lines[split + 1:]
+
+
+@needs_proc
+def test_process_files_lists_processes_and_their_files(tmp_path):
+    result = _run_process_files_cmd(tmp_path, {})
+    assert result.returncode == 0
+    procs, owners_line, owners = _parts(result.stdout)
+    assert owners_line == "# owners: unknown (no dpkg, rpm or apk package database)"
+    assert owners == []
+    assert all(line.split("\t")[0] in ("P", "F") for line in procs)
+    process_lines = [line.split("\t") for line in procs if line.startswith("P\t")]
+    assert process_lines and all(len(f) == 4 and f[1].isdigit() and f[3].startswith("/") for f in process_lines)
+    # every process has at least its own executable mapped
+    assert sum(1 for line in procs if line.startswith("F\t/")) >= len(process_lines)
+
+
+@needs_proc
+def test_process_files_dpkg_is_asked_for_both_usr_spellings(tmp_path):
+    result = _run_process_files_cmd(tmp_path, {
+        "dpkg-query": 'shift; for f in "$@"; do echo "pkg:amd64: $f"; done; exit 1',
+    })
+    assert result.returncode == 0  # dpkg-query's "no owner" exit code is not the tool's
+    procs, owners_line, owners = _parts(result.stdout)
+    assert owners_line == "# owners: dpkg-query -S"
+    asked = {line.split(": ", 1)[1] for line in owners}
+    mapped = {line.split("\t")[1] for line in procs if line.startswith("F\t")}
+    assert mapped <= asked
+    for path in mapped:
+        if path.startswith("/usr/lib/"):
+            assert path[4:] in asked
+        elif path.startswith("/lib/"):
+            assert "/usr" + path in asked
+
+
+@needs_proc
+def test_process_files_rpm_keeps_only_owners_of_mapped_files(tmp_path):
+    bash = os.path.realpath("/bin/bash")
+    result = _run_process_files_cmd(tmp_path, {
+        "rpm": f"printf 'bash\\t{bash}\\nbash\\t/etc/skel/.bashrc\\nother\\t/nonexistent\\n'",
+    })
+    assert result.returncode == 0
+    _, owners_line, owners = _parts(result.stdout)
+    assert owners_line == "# owners: package, file"
+    assert owners == [f"bash\t{bash}"]
+
+
+@needs_proc
+def test_process_files_non_root_goes_through_sudo(tmp_path):
+    result = _run_process_files_cmd(tmp_path, {"sudo": SUDO_RUNS}, uid="1000")
+    assert result.returncode == 0
+    assert result.stdout.startswith("# via sudo\nP\t")
+    assert mcp_ssh.PROCESS_FILES_PLAIN_NOTE not in result.stdout
+
+
+@needs_proc
+def test_process_files_sudo_refused_runs_plain_with_note(tmp_path):
+    result = _run_process_files_cmd(tmp_path, {"sudo": SUDO_REFUSED}, uid="1000")
+    assert result.returncode == 0
+    assert result.stdout.startswith(PROCESS_FILES_NOTE + "P\t")
+    assert "password is required" not in result.stderr
+
+
+def test_process_files_only_the_proc_part_is_escalated():
+    assert '$AS_ROOT sh -c "$PROC"' in mcp_ssh.PROCESS_FILES_CMD
+    assert mcp_ssh.PROCESS_FILES_CMD.count("$AS_ROOT ") == 1
+    for program in ("dpkg-query", "rpm ", "xargs", mcp_ssh.APK_DB_PATH):
+        assert program not in mcp_ssh.PROCESS_FILES_PROC_SCRIPT
 
 # ============================================================
 # get_listening_sockets — ss, with a netstat fallback
