@@ -7,7 +7,7 @@ import configparser
 import json
 import os
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, ContextManager, List
+from typing import Optional, Dict, Any, ContextManager, List, Tuple
 from contextlib import contextmanager
 import signal
 import threading
@@ -908,6 +908,73 @@ def tail_keeping_header(cmd: str, lines: int) -> str:
         f"set -o pipefail; {cmd} | "
         f"{{ IFS= read -r header && printf '%s\\n' \"$header\"; tail -n {lines}; }}"
     )
+
+# ---- Redaction of secrets in free text ----
+# Trade-off, see decision_records/redact_secrets.md: output that can hold secrets (crontabs,
+# command lines, config files) is still returned, but values that LOOK like secrets are
+# replaced by REDACTED before the result leaves the server, so they reach neither the model
+# nor the MCP client's logs. It is pattern-based: a secret in an unusual form is still
+# shown, and a harmless value that looks like one is hidden. Tools that use it say so in
+# their docstring, and every result they return carries a "redaction" field.
+
+REDACTED = "<redacted>"
+# A value: quoted, or up to the next space or quote. Never one that is already redacted,
+# so that a value matched by two rules is replaced (and counted) once; never one that
+# starts with '-', so that `--token --verbose` keeps --verbose.
+_SECRET_VALUE = r"""(?!<redacted>)(?!-)(?:"[^"\n]*"|'[^'\n]*'|[^\s'"]+)"""
+# no bare "pass": it would also catch bypass, passthrough, ...; db_pass is the common exception
+_SECRET_WORDS = r"(?:password|passwd|passphrase|db_pass|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credentials?)"
+# Each pattern has a group k (kept), a group v (replaced) and, optionally, a group s (kept).
+# The order matters: a narrow rule runs before the broad one that would match the same text.
+SECRET_PATTERNS = tuple(re.compile(pattern, flags) for pattern, flags in (
+    # PEM private keys, whole block
+    (r"(?P<k>-----BEGIN [A-Z ]*PRIVATE KEY-----)(?P<v>.*?)(?P<s>-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL),
+    # scheme://user:password@host
+    (r"(?P<k>\b[a-z][a-z0-9+.-]*://[^\s/:@'\"]+:)(?P<v>(?!<redacted>)[^\s@/'\"]+)(?=@)", re.IGNORECASE),
+    # Authorization: Bearer xyz / Basic xyz / xyz
+    (r"(?P<k>\bAuthorization:\s*(?:(?:Bearer|Basic|Token|Digest)\s+)?)(?P<v>(?!<redacted>)[^\s'\"]+)", re.IGNORECASE),
+    (r"(?P<k>\bBearer\s+)(?P<v>[A-Za-z0-9._~+/=-]{8,})", 0),
+    # --password=x, --password x, --api-key x, ...
+    (rf"(?P<k>--{_SECRET_WORDS}(?:=|\s+))(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
+    # mysql -pSECRET (the password is attached to -p; -p alone prompts, -P is the port)
+    (r"(?P<k>\b(?:mysql|mysqldump|mysqladmin|mysqlcheck|mysqlimport|mariadb|mariadb-dump|mariadb-admin)\b"
+     r"[^\n|;&]*?\s-p)(?P<v>(?!<redacted>)(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s'\"]+))", 0),
+    # sshpass -p SECRET
+    (rf"(?P<k>\bsshpass\s+-p\s*)(?P<v>{_SECRET_VALUE})", 0),
+    # curl -u user:password / --user user:password
+    (r"(?P<k>\s(?:-u|--user)\s*[^\s:'\"]+:)(?P<v>(?!<redacted>)[^\s'\"]+)", 0),
+    # DB_PASSWORD=x, export API_TOKEN=x, password: x, "secret": "x"
+    (rf"(?P<k>\b[A-Za-z0-9_.-]*{_SECRET_WORDS}[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
+))
+REDACTION_NOTE = (
+    f"Values that look like secrets (passwords, tokens, keys, credentials in URLs) were replaced "
+    f"with '{REDACTED}'. Redaction is pattern-based: a secret written in an unusual form may "
+    f"still be shown, and a harmless value that looks like a secret may be hidden."
+)
+
+def redact_secrets(text: str) -> Tuple[str, int]:
+    """Replaces values that look like secrets in free text by REDACTED. Returns the text and
+    how many values were replaced. See SECRET_PATTERNS for what is caught."""
+    count = 0
+    for pattern in SECRET_PATTERNS:
+        text, n = pattern.subn(lambda m: m.group("k") + REDACTED + (m.groupdict().get("s") or ""), text)
+        count += n
+    return text, count
+
+def redact_secrets_in_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Redacts the stdout and stderr of a run_ssh_command result in place and adds a
+    "redaction" field with the number of values replaced and REDACTION_NOTE. A result
+    without output (validation or connection error) is returned unchanged."""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return result
+    replaced = 0
+    for stream in ("stdout", "stderr"):
+        if isinstance(data.get(stream), str):
+            data[stream], n = redact_secrets(data[stream])
+            replaced += n
+    result["redaction"] = {"replaced": replaced, "note": REDACTION_NOTE}
+    return result
 
 ## == START OF TOOLS == ##
 
@@ -2575,8 +2642,6 @@ def get_crictl_logs(
     cmd += f" {shlex.quote(container_id)} 2>&1"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
-REDACTED = "<redacted>"
-
 def redact_env_values(obj: Any) -> Any:
     """Returns a copy of parsed JSON with the values of every 'env' / 'envs' entry replaced
     by '<redacted>'. Variable names are kept: ['A=1'] -> ['A=<redacted>'],
@@ -2665,6 +2730,50 @@ def get_crictl_inspect_image(
     result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
     return _redact_env_in_json_stdout(result)
 
+# Process names of the cron daemons: Vixie/Debian cron, cronie and BusyBox (crond), fcron, dcron
+CRON_DAEMON_NAMES = ("cron", "crond", "fcron", "dcron")
+
+def cron_daemon_check_cmd(proc_dir: str = "/proc") -> str:
+    """Builds a command that prints one line saying whether a cron daemon is running, found
+    by its process name in /proc/<pid>/comm (no ps needed, so BusyBox works too):
+      # cron daemon: running: cron (pid 612)
+      # cron daemon: NOT RUNNING (...): scheduled jobs are not executed
+      # cron daemon: cannot tell: ...   - a non-root user on a /proc mounted with hidepid
+    It always exits 0. proc_dir is there for the tests."""
+    names = "|".join(CRON_DAEMON_NAMES)
+    proc = shlex.quote(proc_dir)
+    hidepid_check = (
+        "awk '$2 == \"/proc\" && $4 ~ /(^|,)hidepid=([12]|invisible|noaccess)(,|$)/ { f = 1 } "
+        f"END {{ exit !f }}' {shlex.quote(proc_dir + '/mounts')}"
+    )
+    return (
+        f"cron_found=; for d in {proc}/[0-9]*; do "
+        # read, not cat: no process per /proc entry. A process can end between the glob and the read.
+        '{ read -r c < "$d/comm"; } 2>/dev/null || continue; '
+        f'case "$c" in {names}) cron_found="$cron_found $c (pid ${{d##*/}})," ;; esac; done; '
+        'if [ -n "$cron_found" ]; then echo "# cron daemon: running:${cron_found%,}"; '
+        f'elif [ "$(id -u)" != 0 ] && {hidepid_check}; then '
+        "echo '# cron daemon: cannot tell: /proc is mounted with hidepid, so the processes of other users are hidden'; "
+        f"else echo '# cron daemon: NOT RUNNING (no {', '.join(CRON_DAEMON_NAMES)} process): "
+        "scheduled jobs are not executed'; fi"
+    )
+
+CRONTAB_LIST_CMD = (
+    "if ! command -v crontab >/dev/null 2>&1; then echo 'crontab is not installed on this host' >&2; exit 127; fi; "
+    'out=$(crontab -l 2>&1); rc=$?; '
+    """if [ "$rc" -eq 0 ]; then if [ -n "$out" ]; then printf '%s\\n' "$out"; """
+    """else echo "# the crontab of the login user ($(id -un)) is empty"; fi; """
+    # No crontab is an answer, not a failure: "no crontab for <user>" (Vixie cron, cronie),
+    # "can't open '<user>': No such file or directory" (BusyBox). Anything else still fails.
+    """else case "$out" in *"no crontab for "*|*"can't open"*"No such file"*) """
+    """echo "# no crontab for the login user ($(id -un))" ;; """
+    """*) printf '%s\\n' "$out" >&2; exit "$rc" ;; esac; fi"""
+)
+
+def crontab_tasks_cmd(proc_dir: str = "/proc") -> str:
+    """Builds the get_crontab_tasks command. proc_dir is there for the tests."""
+    return f"{cron_daemon_check_cmd(proc_dir)}; {CRONTAB_LIST_CMD}"
+
 @mcp.tool()
 def get_crontab_tasks(
     host: str,
@@ -2676,10 +2785,108 @@ def get_crontab_tasks(
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
-    Collects crontab -l (crontab list) output from a remote Linux host via SSH
+    Collects the crontab of the LOGIN USER (crontab -l) from a remote Linux host via SSH.
+    For the cron jobs of all users and of the system (/etc/crontab, /etc/cron.d) use
+    get_cron_jobs.
+    The first line says whether a cron daemon is running ('# cron daemon: running: cron
+    (pid 612)'): if it is NOT RUNNING, no cron job on the host is executed.
+    A user without a crontab gets '# no crontab for the login user (<user>)', not an error.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
-    cmd = "crontab -l"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    cmd = crontab_tasks_cmd()
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
+
+CRON_JOBS_MAX_LINES_PER_FILE = 200
+CRON_JOBS_PLAIN_NOTE = (
+    "# not run as root (no sudo -n / doas -n access): only the cron files the login user "
+    "can read are shown; user crontabs usually need root"
+)
+# Run as one `sh -c` (through sudo -n / doas -n when possible): user crontabs are readable
+# by root only, and their directory often cannot even be listed by others. Comments and
+# blank lines are left out; environment lines (MAILTO, PATH, ...) stay, they explain
+# failing jobs. run-parts directories are listed by script name only.
+# Debian: /var/spool/cron/crontabs/<user>; RHEL (cronie): /var/spool/cron/<user>;
+# Alpine (BusyBox): /etc/crontabs/<user>, with /var/spool/cron/crontabs a symlink to it -
+# a directory is read once however it is reached. The script always exits 0.
+# @ROOT@ is a path prefix, empty except in the tests.
+CRON_JOBS_SCRIPT = r"""print_file() {
+    if [ ! -r "$1" ]; then echo "# $1 is not readable by $(id -un)"; return; fi
+    awk -v max=@MAX@ '/^[ \t]*(#|$)/ { next } { n++; if (n <= max) print }
+        END { if (n > max) printf "# ... %d more lines not shown\n", n - max; if (!n) print "# (only comments or empty lines)" }' "$1"
+}
+found=0
+for f in @ROOT@/etc/crontab @ROOT@/etc/anacrontab @ROOT@/etc/cron.d/*; do
+    [ -f "$f" ] || continue
+    found=$((found + 1)); echo "# $f"; print_file "$f"
+done
+seen=
+for dir in @ROOT@/var/spool/cron/crontabs @ROOT@/var/spool/cron @ROOT@/etc/crontabs; do
+    [ -d "$dir" ] || continue
+    real=$(readlink -f "$dir")
+    case " $seen " in *" $real "*) continue ;; esac
+    seen="$seen $real"
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        found=$((found + 1)); echo "# user crontab: ${f##*/} ($f)"; print_file "$f"
+    done
+done
+header=
+for d in @ROOT@/etc/cron.hourly @ROOT@/etc/cron.daily @ROOT@/etc/cron.weekly @ROOT@/etc/cron.monthly @ROOT@/etc/cron.yearly @ROOT@/etc/periodic/*; do
+    [ -d "$d" ] || continue
+    if [ -z "$header" ]; then header=1; echo "# run-parts directories (script names only)"; fi
+    names=$(ls -A "$d" 2>/dev/null | grep -v '^\.placeholder$' | tr '\n' ' ')
+    names=${names% }
+    echo "$d: ${names:-(empty)}"
+done
+[ "$found" -gt 0 ] || echo "# no crontab files found"
+"""
+
+def cron_jobs_cmd(root: str = "", proc_dir: str = "/proc") -> str:
+    """Builds the get_cron_jobs command. root and proc_dir are there for the tests."""
+    script = (CRON_JOBS_SCRIPT
+              .replace("@ROOT@", shlex.quote(root) if root else "")
+              .replace("@MAX@", str(CRON_JOBS_MAX_LINES_PER_FILE)))
+    return (
+        f"{cron_daemon_check_cmd(proc_dir)}; "
+        f"{as_root_or_plain(f'sh -c {shlex.quote(script)}', CRON_JOBS_PLAIN_NOTE)}"
+    )
+
+@mcp.tool()
+def get_cron_jobs(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Lists ALL cron jobs of a remote Linux host via SSH: /etc/crontab, /etc/anacrontab,
+    /etc/cron.d/*, the crontab of every user (/var/spool/cron/crontabs, /var/spool/cron or
+    /etc/crontabs, depending on the distribution) and the scripts in the run-parts
+    directories (/etc/cron.daily, ..., /etc/periodic/* on Alpine; names only).
+    USE THIS TOOL to find what runs on a schedule, e.g. a job that fills the disk, loads the
+    CPU at night or should run but does not. For the login user's crontab alone use
+    get_crontab_tasks; systemd timers are get_systemd_list_timers.
+    The first line says whether a cron daemon is running: if it is NOT RUNNING, none of the
+    jobs listed is executed. Each file starts with a '# <path>' or '# user crontab: <user>'
+    line; comments and blank lines are left out, at most 200 lines per file.
+    User crontabs are readable by root only, so the listing runs through sudo -n / doas -n
+    when the login user is not root; if that is not allowed, it runs as the login user after
+    a '# not run as root' line and shows only what that user can read.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
+    """
+    cmd = cron_jobs_cmd()
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 LISTENING_SOCKETS_PLAIN_NOTE = (
     "# not run as root (no sudo -n / doas -n access): "

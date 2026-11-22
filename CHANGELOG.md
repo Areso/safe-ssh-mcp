@@ -10,6 +10,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 ### Added
+- `get_cron_jobs`: every cron job of the host: `/etc/crontab`, `/etc/anacrontab`,
+  `/etc/cron.d/*`, the crontab of every user (Debian `/var/spool/cron/crontabs`, RHEL
+  `/var/spool/cron`, Alpine `/etc/crontabs`; a directory reached through a symlink is
+  read once) and the script names in the run-parts directories (`/etc/cron.daily`, ...,
+  `/etc/periodic/*`). Comments and blank lines are left out, at most 200 lines per
+  file. Runs through `sudo -n` / `doas -n` when the login user is not root and falls back
+  to what the login user can read, with a `# not run as root` first line. See
+  [decision_records/as_root.md](decision_records/as_root.md).
+- `get_crontab_tasks` and `get_cron_jobs` start with a line saying whether a cron daemon
+  is running (`cron`, `crond`, `fcron` or `dcron`, found in `/proc/<pid>/comm`):
+  `# cron daemon: running: cron (pid 612)`, `# cron daemon: NOT RUNNING ...: scheduled
+  jobs are not executed`, or `cannot tell` for a non-root user on a `/proc` mounted with
+  `hidepid`. Shared helper `cron_daemon_check_cmd`.
+- Redaction of secrets in free-text output: `redact_secrets` / `redact_secrets_in_result`
+  replace values that look like passwords, tokens, keys and credentials in URLs with
+  `<redacted>` and add a `redaction` field (`replaced` count and a note on its limits) to
+  the result. Pattern-based, so not complete. Used by `get_crontab_tasks` and
+  `get_cron_jobs`. See [decision_records/redact_secrets.md](decision_records/redact_secrets.md).
+
+### Fixed
+- `get_crontab_tasks` returned `ok: false` for a user without a crontab (`crontab -l`
+  exits 1). It now returns `# no crontab for the login user (<user>)` with exit code 0;
+  an empty crontab says so too. Other failures (permission denied, not allowed to use
+  crontab) still fail, with their message. Not done with `success_exit_codes=(0, 1)`,
+  which would have hidden those.
 - `get_fstab`: `/etc/fstab` as written, comments included.
 - `get_mount_problems`: checks every `/etc/fstab` entry against what is mounted now and
   prints one line per problem, then a summary (`no problems found (N fstab entries

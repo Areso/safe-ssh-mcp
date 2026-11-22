@@ -57,6 +57,7 @@ A few examples from each group; `<...>` marks a validated parameter.
 - get_process_files : `/proc/<pid>/exe` and `/proc/<pid>/maps` of every process, with the package that owns each file
 - get_failed_logins : `lastb -F -n <lines>`
 - get_coredumps : `coredumpctl list --no-pager`
+- get_cron_jobs : `/etc/crontab`, `/etc/cron.d/*` and every user's crontab (secrets redacted), with a check that a cron daemon runs
 
 Click to open [full list of available tools](tools.md)  
 

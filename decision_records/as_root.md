@@ -19,6 +19,7 @@ These tools run their command as root when the login user is not root:
   below).
 - `get_mount_problems` — the same, for its `findmnt --verify` part only (added
   2026-11-22, see "Tools that fall back" below).
+- `get_cron_jobs` — the same (added 2026-11-22, see "Tools that fall back" below).
 
 The helper `as_root` picks, on the remote host:
 
@@ -155,6 +156,28 @@ findmnt --verify --tab-file /etc/fstab
 
 The first part of the tool (fstab against `/proc/mounts` and `/proc/swaps`) reads only
 world-readable files and runs as the login user.
+
+`get_cron_jobs` (added 2026-11-22) falls back through `as_root_or_plain`. User
+crontabs are readable by root only (`/var/spool/cron/crontabs` is `drwx-wx--T`, so
+others cannot even list it; Alpine's `/etc/crontabs/<user>` files are `0600`), while
+`/etc/crontab` and `/etc/cron.d` are usually world-readable. Without root the tool shows
+what the login user can read, after:
+
+```
+# not run as root (no sudo -n / doas -n access): only the cron files the login user can read are shown; user crontabs usually need root
+```
+
+Like `get_process_files`, it escalates one fixed `sh -c '<script>'` (copy it from
+`CRON_JOBS_SCRIPT` in `mcp_ssh.py` for a sudoers rule), because the files to read are
+only known after listing directories that need root. The cron daemon check before it
+reads `/proc/<pid>/comm` and runs as the login user.
+
+**Reminder: root output can hold other users' secrets.** Escalating to read files that
+belong to other users means their secrets come back too: crontabs carry passwords and
+tokens inline. `get_cron_jobs` therefore redacts values that look like secrets before
+returning anything; that redaction is pattern-based and not complete. Any new tool that
+reads other users' or system files as root should do the same. See
+[redact_secrets.md](redact_secrets.md).
 
 ## Limits
 

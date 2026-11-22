@@ -58,7 +58,8 @@ import mcp_ssh
     (mcp_ssh.get_lsblk, "lsblk"),
     (mcp_ssh.get_docker_ps_all, mcp_ssh.DOCKER_PREFIX + "$DOCKER ps --all"),
     (mcp_ssh.get_docker_images, mcp_ssh.DOCKER_PREFIX + "$DOCKER images --digests"),
-    (mcp_ssh.get_crontab_tasks, "crontab -l"),
+    (mcp_ssh.get_crontab_tasks, mcp_ssh.crontab_tasks_cmd()),
+    (mcp_ssh.get_cron_jobs, mcp_ssh.cron_jobs_cmd()),
     (mcp_ssh.get_listening_sockets, mcp_ssh.LISTENING_SOCKETS_CMD),
     (mcp_ssh.get_process_files, mcp_ssh.PROCESS_FILES_CMD),
     (mcp_ssh.get_journalctl_disk_usage, mcp_ssh.JOURNAL_DISK_USAGE_CMD),
@@ -752,6 +753,250 @@ def test_mount_problems_old_findmnt_without_verify(tmp_path):
                                  programs={"findmnt": "echo ' -s, --fstab  search in static table'"})
     assert result.returncode == 0, result.stderr
     assert _verify_part(result) == [NO_VERIFY]
+
+
+# ============================================================
+# cron: the daemon check, get_crontab_tasks, get_cron_jobs
+# ============================================================
+
+def _fake_proc(tmp_path, processes, proc_mount_opts="rw,nosuid,nodev,noexec,relatime"):
+    """A fake /proc with /proc/<pid>/comm for each (pid, name) and a mounts file."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    for pid, name in processes:
+        (proc / str(pid)).mkdir()
+        if name is not None:  # None: a process that ended between the glob and the read
+            (proc / str(pid) / "comm").write_text(name + "\n")
+    (proc / "self").mkdir()
+    (proc / "mounts").write_text(f"proc /proc proc {proc_mount_opts} 0 0\n")
+    return str(proc)
+
+
+def _cron_bin(tmp_path, programs, uid="0"):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("awk", "readlink", "ls", "grep", "tr", "sh"):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    for name, body in {"id": f'if [ "$1" = -un ]; then echo tester; else echo {uid}; fi', **programs}.items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    return bin_dir
+
+
+def _run_daemon_check(tmp_path, processes, uid="0", **kwargs):
+    proc = _fake_proc(tmp_path, processes, **kwargs)
+    bin_dir = _cron_bin(tmp_path, {}, uid)
+    return _run(mcp_ssh.cron_daemon_check_cmd(proc), bin_dir)
+
+
+@pytest.mark.parametrize("name", mcp_ssh.CRON_DAEMON_NAMES)
+def test_cron_daemon_found(name, tmp_path):
+    result = _run_daemon_check(tmp_path, [(1, "systemd"), (612, name), (700, "sshd")])
+    assert result.returncode == 0
+    assert result.stdout == f"# cron daemon: running: {name} (pid 612)\n"
+
+
+def test_cron_daemon_several_and_vanished_processes(tmp_path):
+    result = _run_daemon_check(tmp_path, [(5, "cron"), (6, None), (7, "crond"), (8, "cronolog")])
+    assert result.stdout == "# cron daemon: running: cron (pid 5), crond (pid 7)\n"
+    assert result.stderr == ""
+
+
+def test_cron_daemon_not_running(tmp_path):
+    result = _run_daemon_check(tmp_path, [(1, "init"), (2, "sshd")])
+    assert result.returncode == 0
+    assert result.stdout.startswith("# cron daemon: NOT RUNNING")
+    assert "scheduled jobs are not executed" in result.stdout
+
+
+@pytest.mark.parametrize("opts", ["rw,hidepid=2", "rw,nosuid,hidepid=invisible,gid=5", "rw,hidepid=1"])
+def test_cron_daemon_cannot_tell_under_hidepid(opts, tmp_path):
+    result = _run_daemon_check(tmp_path, [(1, "init")], uid="1000", proc_mount_opts=opts)
+    assert result.stdout.startswith("# cron daemon: cannot tell: /proc is mounted with hidepid")
+
+
+def test_cron_daemon_hidepid_does_not_hide_from_root(tmp_path):
+    result = _run_daemon_check(tmp_path, [(1, "init")], uid="0", proc_mount_opts="rw,hidepid=2")
+    assert result.stdout.startswith("# cron daemon: NOT RUNNING")
+
+
+def _run_crontab_tasks(tmp_path, crontab_body, uid="1000"):
+    proc = _fake_proc(tmp_path, [(612, "cron")])
+    programs = {} if crontab_body is None else {"crontab": crontab_body}
+    bin_dir = _cron_bin(tmp_path, programs, uid)
+    return _run(mcp_ssh.crontab_tasks_cmd(proc), bin_dir)
+
+
+DAEMON_LINE = "# cron daemon: running: cron (pid 612)\n"
+
+
+def test_crontab_tasks_lists_crontab(tmp_path):
+    result = _run_crontab_tasks(tmp_path, "echo '0 2 * * * /backup.sh'")
+    assert result.returncode == 0
+    assert result.stdout == DAEMON_LINE + "0 2 * * * /backup.sh\n"
+
+
+def test_crontab_tasks_empty_crontab(tmp_path):
+    result = _run_crontab_tasks(tmp_path, "exit 0")
+    assert result.returncode == 0
+    assert result.stdout == DAEMON_LINE + "# the crontab of the login user (tester) is empty\n"
+
+
+@pytest.mark.parametrize("message", [
+    "no crontab for tester",                                   # Vixie cron, cronie
+    "crontab: can't open 'tester': No such file or directory",  # BusyBox
+])
+def test_crontab_tasks_no_crontab_is_not_an_error(message, tmp_path):
+    result = _run_crontab_tasks(tmp_path, f"echo \"{message}\" >&2; exit 1")
+    assert result.returncode == 0
+    assert result.stdout == DAEMON_LINE + "# no crontab for the login user (tester)\n"
+
+
+@pytest.mark.parametrize("message", [
+    "crontab: can't open 'tester': Permission denied",
+    "You (tester) are not allowed to use this program (crontab)",
+])
+def test_crontab_tasks_real_failure_still_fails(message, tmp_path):
+    result = _run_crontab_tasks(tmp_path, f"echo \"{message}\" >&2; exit 1")
+    assert result.returncode == 1
+    assert result.stdout == DAEMON_LINE
+    assert message in result.stderr
+
+
+def test_crontab_tasks_without_crontab_binary(tmp_path):
+    result = _run_crontab_tasks(tmp_path, None)
+    assert result.returncode == 127
+    assert "crontab is not installed on this host" in result.stderr
+
+
+def _cron_tree(tmp_path, files, symlinks=()):
+    root = tmp_path / "root"
+    for path, content in files.items():
+        f = root / path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if content is None:
+            f.mkdir(exist_ok=True)
+        else:
+            f.write_text(content)
+    for link, target in symlinks:
+        (root / link).parent.mkdir(parents=True, exist_ok=True)
+        (root / link).symlink_to(target)
+    return str(root)
+
+
+def _run_cron_jobs(tmp_path, root, uid="0", programs=None):
+    proc = _fake_proc(tmp_path, [(612, "cron")])
+    bin_dir = _cron_bin(tmp_path, programs or {}, uid)
+    return _run(mcp_ssh.cron_jobs_cmd(root, proc), bin_dir)
+
+
+def test_cron_jobs_debian_layout(tmp_path):
+    root = _cron_tree(tmp_path, {
+        "etc/crontab": "# header\nSHELL=/bin/sh\n\n17 * * * * root run-parts /etc/cron.hourly\n",
+        "etc/cron.d/sysstat": "PATH=/usr/bin\n5 * * * * root sa1\n",
+        "etc/cron.d/.placeholder": "# not a job\n",
+        "etc/cron.d/only-comments": "# nothing\n\n",
+        "var/spool/cron/crontabs/alice": "# edit with crontab -e\nMAILTO=a@x\n0 2 * * * /home/alice/b.sh\n",
+        "etc/cron.daily/logrotate": "#!/bin/sh\n",
+        "etc/cron.daily/.placeholder": "",
+        "etc/cron.weekly": None,
+    })
+    result = _run_cron_jobs(tmp_path, root)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "# cron daemon: running: cron (pid 612)",
+        f"# {root}/etc/crontab",
+        "SHELL=/bin/sh",
+        "17 * * * * root run-parts /etc/cron.hourly",
+        f"# {root}/etc/cron.d/only-comments",
+        "# (only comments or empty lines)",
+        f"# {root}/etc/cron.d/sysstat",
+        "PATH=/usr/bin",
+        "5 * * * * root sa1",
+        f"# user crontab: alice ({root}/var/spool/cron/crontabs/alice)",
+        "MAILTO=a@x",
+        "0 2 * * * /home/alice/b.sh",
+        "# run-parts directories (script names only)",
+        f"{root}/etc/cron.daily: logrotate",
+        f"{root}/etc/cron.weekly: (empty)",
+    ]
+
+
+def test_cron_jobs_rhel_layout(tmp_path):
+    root = _cron_tree(tmp_path, {
+        "var/spool/cron/bob": "*/5 * * * * /opt/bob/poll\n",
+        "etc/anacrontab": "1 5 cron.daily run-parts /etc/cron.daily\n",
+    })
+    result = _run_cron_jobs(tmp_path, root)
+    assert result.stdout.splitlines()[1:] == [
+        f"# {root}/etc/anacrontab",
+        "1 5 cron.daily run-parts /etc/cron.daily",
+        f"# user crontab: bob ({root}/var/spool/cron/bob)",
+        "*/5 * * * * /opt/bob/poll",
+    ]
+
+
+def test_cron_jobs_alpine_layout_read_once_through_symlink(tmp_path):
+    root = _cron_tree(tmp_path, {
+        "etc/crontabs/root": "*/15 * * * * run-parts /etc/periodic/15min\n",
+        "etc/periodic/daily": None,
+        "etc/periodic/15min/clean": "#!/bin/sh\n",
+    }, symlinks=[("var/spool/cron/crontabs", "../../../etc/crontabs")])
+    result = _run_cron_jobs(tmp_path, root)
+    lines = result.stdout.splitlines()
+    assert sum(line.startswith("# user crontab: root") for line in lines) == 1
+    assert lines[1:] == [
+        f"# user crontab: root ({root}/var/spool/cron/crontabs/root)",
+        "*/15 * * * * run-parts /etc/periodic/15min",
+        "# run-parts directories (script names only)",
+        f"{root}/etc/periodic/15min: clean",
+        f"{root}/etc/periodic/daily: (empty)",
+    ]
+
+
+def test_cron_jobs_caps_long_files(tmp_path):
+    root = _cron_tree(tmp_path, {"etc/cron.d/generated": "".join(f"{i} * * * * job{i}\n" for i in range(250))})
+    lines = _run_cron_jobs(tmp_path, root).stdout.splitlines()
+    assert lines[2] == "0 * * * * job0"
+    assert lines[-1] == "# ... 50 more lines not shown"
+    assert len(lines) == 2 + mcp_ssh.CRON_JOBS_MAX_LINES_PER_FILE + 1
+
+
+def test_cron_jobs_nothing_found(tmp_path):
+    root = _cron_tree(tmp_path, {"etc/hostname": "h\n"})
+    result = _run_cron_jobs(tmp_path, root)
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[1:] == ["# no crontab files found"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a file without read permission")
+def test_cron_jobs_unreadable_file_is_reported(tmp_path):
+    root = _cron_tree(tmp_path, {"etc/cron.d/secret": "0 * * * * x\n"})
+    os.chmod(os.path.join(root, "etc/cron.d/secret"), 0)
+    try:
+        lines = _run_cron_jobs(tmp_path, root).stdout.splitlines()
+    finally:
+        os.chmod(os.path.join(root, "etc/cron.d/secret"), 0o600)
+    assert lines[1:] == [f"# {root}/etc/cron.d/secret", f"# {root}/etc/cron.d/secret is not readable by tester"]
+
+
+def test_cron_jobs_non_root_goes_through_sudo(tmp_path):
+    root = _cron_tree(tmp_path, {"etc/crontab": "0 * * * * root x\n"})
+    result = _run_cron_jobs(tmp_path, root, uid="1000", programs={"sudo": 'shift; echo "via sudo"; "$@"'})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[1:3] == ["via sudo", f"# {root}/etc/crontab"]
+
+
+def test_cron_jobs_sudo_refused_runs_plain_with_note(tmp_path):
+    root = _cron_tree(tmp_path, {"etc/crontab": "0 * * * * root x\n"})
+    result = _run_cron_jobs(tmp_path, root, uid="1000",
+                            programs={"sudo": "echo 'sudo: a password is required' >&2; exit 1"})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[1:] == [
+        mcp_ssh.CRON_JOBS_PLAIN_NOTE, f"# {root}/etc/crontab", "0 * * * * root x",
+    ]
+    assert "password is required" not in result.stdout
 
 
 # ============================================================
