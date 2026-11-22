@@ -365,9 +365,15 @@ def is_probable_timeout(exit_code: int, elapsed_s: float, timeout_s: int) -> boo
     it ended with one of the timeout exit codes AND ran for at least the timeout."""
     return exit_code in TIMEOUT_EXIT_CODES and elapsed_s >= timeout_s
 
+def timeout_wrapped(cmd: str, timeout_s: int) -> str:
+    """Wraps cmd the way every command is run on the remote host: under `timeout`, in bash
+    when the host has it and in sh otherwise (SHELL_LAUNCHER). Anything that runs a tool's
+    command must use this, or a command that relies on bash (set -o pipefail, read) breaks."""
+    return f"timeout {timeout_s}s sh -c {shlex.quote(SHELL_LAUNCHER)} {shlex.quote(cmd)}"
+
 def _run_cmd(client: paramiko.SSHClient, cmd: str, timeout_s: int = 20) -> Dict[str, Any]:
     channel_timeout_s = 5 
-    timeout_cmd = f"timeout {timeout_s}s sh -c {shlex.quote(SHELL_LAUNCHER)} {shlex.quote(cmd)}"
+    timeout_cmd = timeout_wrapped(cmd, timeout_s)
     started = time.monotonic()
     stdin, stdout, stderr = client.exec_command(timeout_cmd, timeout=timeout_s+channel_timeout_s)
     # Read the output BEFORE waiting for the exit status: once the unread output fills the
@@ -978,6 +984,8 @@ def redact_secrets_in_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 ## == START OF TOOLS == ##
 
+DISK_FREE_CMD = "df -h"
+
 @mcp.tool()
 def get_disk_free(
     host: str,
@@ -991,7 +999,9 @@ def get_disk_free(
     """
     Collects disk usage (df -h) from a remote Linux host via SSH.
     """
-    return run_ssh_command(host, user, "df -h", port, password, key_path, timeout, accept_new_hostkey)
+    return run_ssh_command(host, user, DISK_FREE_CMD, port, password, key_path, timeout, accept_new_hostkey)
+
+INODE_USAGE_CMD = "df -i"
 
 @mcp.tool()
 def get_inode_usage(
@@ -1006,7 +1016,7 @@ def get_inode_usage(
     """
     Collects inode usage (df -i) from a remote Linux host via SSH.
     """
-    return run_ssh_command(host, user, "df -i", port, password, key_path, timeout, accept_new_hostkey)
+    return run_ssh_command(host, user, INODE_USAGE_CMD, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
 def get_disk_usage(
@@ -1334,6 +1344,13 @@ def get_installed_packages(
     )
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+def dmesg_cmd(safe_since: Optional[str] = None) -> str:
+    """Builds the get_dmesg command (as root). safe_since must come from normalize_since."""
+    cmd = "dmesg"
+    if safe_since is not None:
+        cmd += f" --since {shlex.quote(safe_since)}"
+    return as_root(cmd)
+
 @mcp.tool()
 def get_dmesg(
     host: str,
@@ -1353,13 +1370,15 @@ def get_dmesg(
     'yesterday' or 'YYYY-MM-DD HH:MM:SS'. It requires util-linux 2.37+ on the remote host;
     on older hosts dmesg fails with an unrecognized option error - then call without since.
     """
-    cmd = "dmesg"
+    safe_since = None
     if since is not None:
         safe_since = normalize_since(since)
         if safe_since is None:
             return {"ok": False, "error": SINCE_ERROR}
-        cmd += f" --since {shlex.quote(safe_since)}"
-    return run_ssh_command(host, user, as_root(cmd), port, password, key_path, timeout, accept_new_hostkey)
+    cmd = dmesg_cmd(safe_since)
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+UPTIME_CMD = "uptime"
 
 @mcp.tool()
 def get_uptime(
@@ -1374,7 +1393,7 @@ def get_uptime(
     """
     Collects uptime from a remote Linux host via SSH
     """
-    return run_ssh_command(host, user, "uptime", port, password, key_path, timeout, accept_new_hostkey)
+    return run_ssh_command(host, user, UPTIME_CMD, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
 def get_current_datetime(
@@ -1422,6 +1441,8 @@ def get_hostname(
     """
     return run_ssh_command(host, user, HOSTNAME_CMD, port, password, key_path, timeout, accept_new_hostkey)
 
+OS_RELEASE_CMD = "cat /etc/os-release"
+
 @mcp.tool()
 def get_distroname_version(
     host: str,
@@ -1435,7 +1456,9 @@ def get_distroname_version(
     """
     Collects distr details from os-release from a remote Linux host via SSH
     """
-    return run_ssh_command(host, user, "cat /etc/os-release", port, password, key_path, timeout, accept_new_hostkey)
+    return run_ssh_command(host, user, OS_RELEASE_CMD, port, password, key_path, timeout, accept_new_hostkey)
+
+KERNEL_VERSION_CMD = "uname -srvm"
 
 @mcp.tool()
 def get_kernel_version(
@@ -1450,7 +1473,7 @@ def get_kernel_version(
     """
     Collects kernel name, release, build version and architecture (uname -srvm) from a remote Linux host via SSH
     """
-    return run_ssh_command(host, user, "uname -srvm", port, password, key_path, timeout, accept_new_hostkey)
+    return run_ssh_command(host, user, KERNEL_VERSION_CMD, port, password, key_path, timeout, accept_new_hostkey)
 
 # One line "package: <name> <version>" with the distro package version of the C library.
 # Prints nothing (and still succeeds) when the package manager or the package is missing.
@@ -1580,6 +1603,8 @@ def get_systemd_list_all(
     cmd = "systemctl list-units --all --no-pager"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+SYSTEMD_FAILED_CMD = "systemctl list-units --state=failed --no-pager"
+
 @mcp.tool()
 def get_systemd_list_failed(
     host: str,
@@ -1593,7 +1618,7 @@ def get_systemd_list_failed(
     """
     Lists failed systemd units. USE THIS TOOL to check for FAILED daemons/services/units.
     """
-    cmd = "systemctl list-units --state=failed --no-pager"
+    cmd = SYSTEMD_FAILED_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 
@@ -1700,6 +1725,8 @@ def get_ps_aux_top_mem_consumers(
     cmd = PS_TOP_MEM_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+FREE_MEMORY_CMD = "free -h && echo && cat /proc/meminfo"
+
 @mcp.tool()
 def get_free_memory(
     host: str,
@@ -1713,7 +1740,7 @@ def get_free_memory(
     """
     Returns free memory, swap (total/free), page cache, HugePages and so on
     """
-    cmd = "free -h && echo && cat /proc/meminfo"
+    cmd = FREE_MEMORY_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
@@ -1908,6 +1935,11 @@ def get_mount_problems(
     cmd = mount_problems_cmd()
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+PRESSURE_CMD = (
+    'for r in cpu io memory; do echo "== $r =="; '
+    "cat /proc/pressure/$r 2>/dev/null || echo 'PSI not supported'; done"
+)
+
 @mcp.tool()
 def get_pressure(
     host: str,
@@ -1927,11 +1959,12 @@ def get_pressure(
     total is the cumulative stall time in microseconds.
     Prints 'PSI not supported' for a resource if the kernel is older than 4.20 or PSI is disabled.
     """
-    cmd = (
-        'for r in cpu io memory; do echo "== $r =="; '
-        "cat /proc/pressure/$r 2>/dev/null || echo 'PSI not supported'; done"
-    )
+    cmd = PRESSURE_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+def vmstat_cmd(samples: int = 5) -> str:
+    """vmstat, `samples` reports 1 second apart; the first is the average since boot."""
+    return f"vmstat 1 {samples}"
 
 @mcp.tool()
 def get_vmstat(
@@ -1950,7 +1983,7 @@ def get_vmstat(
     USE THIS TOOL to see what the host is doing right now: swapping, I/O wait, CPU saturation.
     The FIRST report line is the average since boot - judge the current state by the other four.
     """
-    cmd = "vmstat 1 5"
+    cmd = vmstat_cmd()
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 # ---- get_iostat / get_mpstat: sysstat, or the same numbers computed from /proc ----
@@ -2275,6 +2308,8 @@ def get_cpu_info(
     cmd = cpu_info_cmd(include_flags)
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+LSBLK_CMD = "lsblk"
+
 @mcp.tool()
 def get_lsblk(
     host: str,
@@ -2288,7 +2323,7 @@ def get_lsblk(
     """
     Collects lsblk output from a remote Linux host via SSH
     """
-    cmd = "lsblk"
+    cmd = LSBLK_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
@@ -3179,6 +3214,16 @@ def get_service_logs_from_journalctl(
         cmd += f" --since {shlex.quote(safe_since)}"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+def journal_errors_cmd(lines: int, current_boot_only: bool = False, safe_since: Optional[str] = None) -> str:
+    """Builds the get_journal_errors command. The arguments must already be validated:
+    lines with is_valid_lines, safe_since by normalize_since."""
+    cmd = f"journalctl -p warning -n {lines} --no-pager"
+    if current_boot_only:
+        cmd += " -b"
+    if safe_since is not None:
+        cmd += f" --since {shlex.quote(safe_since)}"
+    return cmd
+
 @mcp.tool()
 def get_journal_errors(
     host: str,
@@ -3204,14 +3249,12 @@ def get_journal_errors(
     if not isinstance(current_boot_only, bool):
         return {"ok": False, "error": "Invalid value of current_boot_only, should be Boolean"}
 
-    cmd = f"journalctl -p warning -n {lines} --no-pager"
-    if current_boot_only:
-        cmd += " -b"
+    safe_since = None
     if since is not None:
         safe_since = normalize_since(since)
         if safe_since is None:
             return {"ok": False, "error": SINCE_ERROR}
-        cmd += f" --since {shlex.quote(safe_since)}"
+    cmd = journal_errors_cmd(lines, current_boot_only, safe_since)
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 JOURNAL_DISK_USAGE_PLAIN_NOTE = (
