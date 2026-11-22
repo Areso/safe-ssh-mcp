@@ -27,6 +27,7 @@ A few examples from each group; `<...>` marks a validated parameter.
 - get_systemd_list_failed : `systemctl list-units --state=failed --no-pager`
 - get_systemd_status : `systemctl status <daemon>`
 - get_journal_errors : `journalctl -p warning -n <lines> --no-pager`
+- get_journalctl_disk_usage : `journalctl --disk-usage`
 - get_dmesg : `dmesg`
 
 **Network**

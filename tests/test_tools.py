@@ -61,6 +61,7 @@ import mcp_ssh
     (mcp_ssh.get_crontab_tasks, "crontab -l"),
     (mcp_ssh.get_listening_sockets, mcp_ssh.LISTENING_SOCKETS_CMD),
     (mcp_ssh.get_process_files, mcp_ssh.PROCESS_FILES_CMD),
+    (mcp_ssh.get_journalctl_disk_usage, mcp_ssh.JOURNAL_DISK_USAGE_CMD),
 ])
 def test_simple_tool_sends_correct_command(tool_func, expected_cmd, mock_run_ssh_command):
     tool_func(host="testhost", user="testuser")
@@ -179,6 +180,82 @@ def test_journal_errors_non_bool_current_boot_rejected(mock_run_ssh_command):
     result = mcp_ssh.get_journal_errors(host="h", user="u", current_boot_only="yes")
     assert result["ok"] is False
     mock_run_ssh_command.assert_not_called()
+
+
+# ============================================================
+# get_journalctl_disk_usage — journalctl --disk-usage, as root when allowed
+# ============================================================
+
+def _run_journal_disk_usage_cmd(tmp_path, programs, uid="0"):
+    """Runs the command with only the given fake programs (name -> script body) on PATH."""
+    programs = {"id": f"echo {uid}", **programs}
+    for name, body in programs.items():
+        f = tmp_path / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    return subprocess.run(
+        ["/bin/bash", "-c", mcp_ssh.JOURNAL_DISK_USAGE_CMD], capture_output=True, text=True,
+        env={"PATH": str(tmp_path)},
+    )
+
+
+JOURNALCTL_FAKE = 'echo "journalctl $*"'
+JOURNAL_PLAIN_NOTE = mcp_ssh.JOURNAL_DISK_USAGE_PLAIN_NOTE + "\n"
+
+
+def test_journal_disk_usage_root_runs_directly(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {
+        "journalctl": JOURNALCTL_FAKE, "sudo": 'shift; echo "via sudo: $*"',
+    })
+    assert result.returncode == 0
+    assert result.stdout == "journalctl --disk-usage\n"
+
+
+def test_journal_disk_usage_non_root_goes_through_sudo(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {
+        "journalctl": JOURNALCTL_FAKE, "sudo": 'shift; echo "via sudo: $*"',
+    }, uid="1000")
+    assert result.returncode == 0
+    assert result.stdout == "via sudo: journalctl --disk-usage\n"
+
+
+def test_journal_disk_usage_non_root_goes_through_doas(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {
+        "journalctl": JOURNALCTL_FAKE, "doas": 'shift; echo "via doas: $*"',
+    }, uid="1000")
+    assert result.returncode == 0
+    assert result.stdout == "via doas: journalctl --disk-usage\n"
+
+
+def test_journal_disk_usage_sudo_refused_runs_plain_with_note(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {
+        "journalctl": JOURNALCTL_FAKE,
+        "sudo": "echo 'sudo: a password is required' >&2; exit 1",
+    }, uid="1000")
+    assert result.returncode == 0
+    assert result.stdout == JOURNAL_PLAIN_NOTE + "journalctl --disk-usage\n"
+    assert "password is required" not in result.stderr
+
+
+def test_journal_disk_usage_no_sudo_or_doas_runs_plain_with_note(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {"journalctl": JOURNALCTL_FAKE}, uid="1000")
+    assert result.returncode == 0
+    assert result.stdout == JOURNAL_PLAIN_NOTE + "journalctl --disk-usage\n"
+
+
+def test_journal_disk_usage_without_journalctl_says_so(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {"sudo": 'shift; echo "via sudo: $*"'}, uid="1000")
+    assert result.returncode == 127
+    assert result.stdout == ""
+    assert "journalctl is not installed on this host" in result.stderr
+
+
+def test_journal_disk_usage_failure_is_not_hidden(tmp_path):
+    result = _run_journal_disk_usage_cmd(tmp_path, {
+        "journalctl": "echo 'journalctl: boom' >&2; exit 1",
+    })
+    assert result.returncode == 1
+    assert "journalctl: boom" in result.stderr
 
 
 # ============================================================

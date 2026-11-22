@@ -15,6 +15,8 @@ These tools run their command as root when the login user is not root:
   refused (added 2026-11-12, see "Tools that fall back" below).
 - `get_process_files` — the same, for its `/proc` part only (added 2026-11-17, see
   "Tools that fall back" below).
+- `get_journalctl_disk_usage` — the same (added 2026-11-22, see "Tools that fall back"
+  below).
 
 The helper `as_root` picks, on the remote host:
 
@@ -114,6 +116,21 @@ unrestricted `sudo -n` / `doas -n` (the usual cloud image setup) needs nothing.
 The alternative, a fixed list of commands such as `cat /proc/*/maps`, was rejected:
 the shell expands the glob before sudo sees it, so the rule would have to allow `cat`
 on any path, which is worse.
+
+`get_journalctl_disk_usage` (added 2026-11-22) does the same. `journalctl --disk-usage`
+works for any user, but it only adds up the journal files that user can read: usually
+just its own user journal, unless it is in the `systemd-journal` or `adm` group. The
+fallback line is:
+
+```
+# not run as root (no sudo -n / doas -n access): only the journal files the login user can read are counted
+```
+
+Command for the admin's rule:
+
+```
+journalctl --disk-usage
+```
 
 ## Limits
 

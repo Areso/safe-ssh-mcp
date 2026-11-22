@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
+## Unreleased
+### Added
+- `get_journalctl_disk_usage`: how much disk space the systemd journal takes
+  (`journalctl --disk-usage`). Runs through `sudo -n` / `doas -n` when the login user is
+  not root, so every journal is counted, and falls back to the login user, with a
+  `# not run as root` first line, if that is refused. Says `journalctl is not installed
+  on this host` on hosts without systemd. See
+  [decision_records/as_root.md](decision_records/as_root.md).
+
 ## 0.2.3 - 2026-11-17
 ### Added
 - `get_process_files`: for every running process, its executable and the shared libraries

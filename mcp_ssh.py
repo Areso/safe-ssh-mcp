@@ -2563,7 +2563,39 @@ def get_journal_errors(
         cmd += f" --since {shlex.quote(safe_since)}"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
-BUSYBOX_LAST_HEADER = "# BusyBox: last (short times without the year)"
+JOURNAL_DISK_USAGE_PLAIN_NOTE = (
+    "# not run as root (no sudo -n / doas -n access): "
+    "only the journal files the login user can read are counted"
+)
+# Checked first, with a clear message: Alpine and other hosts without systemd have no journald
+JOURNAL_DISK_USAGE_CMD = (
+    "if ! command -v journalctl >/dev/null 2>&1; then "
+    "echo 'journalctl is not installed on this host' >&2; exit 127; fi; "
+    f"{as_root_or_plain('journalctl --disk-usage', JOURNAL_DISK_USAGE_PLAIN_NOTE)}"
+)
+
+@mcp.tool()
+def get_journalctl_disk_usage(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Shows how much disk space the systemd journal takes (journalctl --disk-usage): the sum
+    of all active and archived journal files. USE THIS TOOL when /var/log is large or the
+    disk is full on a systemd host.
+    If the login user is not root, runs through sudo -n / doas -n so that every journal is
+    counted; if that is not allowed, runs as the login user and says so in a
+    "# not run as root" line (the total then covers only the journals it can read).
+    """
+    cmd = JOURNAL_DISK_USAGE_CMD
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+BUSYBOX_LAST_HEADER ="# BusyBox: last (short times without the year)"
 BUSYBOX_LAST_SINCE_ERROR = "last on this host is the BusyBox one and cannot filter by time; call without since"
 
 def _run_login_history(
