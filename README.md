@@ -17,6 +17,8 @@ A few examples from each group; `<...>` marks a validated parameter.
 - get_disk_free : `df -h`
 - get_disk_usage : `find <path> -mindepth 1 -maxdepth 1 -exec du -sh -- {} + 2>/dev/null | sort -rh | head -n 20`
 - get_mounts : `findmnt` (or `cat /proc/mounts`)
+- get_fstab : `cat /etc/fstab`
+- get_mount_problems : fstab against `/proc/mounts` and `/proc/swaps` (not mounted, read-only, swap off), then `findmnt --verify`
 
 **CPU, memory and processes**
 - get_top : `top -b -n 2 -d 1 -c -w 512`, second sample, first 30 lines

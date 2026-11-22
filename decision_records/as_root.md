@@ -17,6 +17,8 @@ These tools run their command as root when the login user is not root:
   "Tools that fall back" below).
 - `get_journalctl_disk_usage` — the same (added 2026-11-22, see "Tools that fall back"
   below).
+- `get_mount_problems` — the same, for its `findmnt --verify` part only (added
+  2026-11-22, see "Tools that fall back" below).
 
 The helper `as_root` picks, on the remote host:
 
@@ -131,6 +133,28 @@ Command for the admin's rule:
 ```
 journalctl --disk-usage
 ```
+
+`get_mount_problems` (added 2026-11-22) falls back too, but cannot use
+`as_root_or_plain`. That helper treats any non-zero exit as a refused escalation, and
+`findmnt --verify` exits 1 whenever it finds a problem in fstab: a real finding made as
+root would be thrown away, rerun as the login user and labelled "not run as root". So the
+tool decides from the output instead: the escalation was refused only when it starts with
+`sudo:` or `doas:`. Without root, findmnt still checks sources, mount points and types as
+written, but cannot read the on-disk filesystem type, and warns about it for every
+entry. The fallback line is:
+
+```
+# not run as root (no sudo -n / doas -n access): on-disk filesystem types were not checked, so 'cannot detect on-disk filesystem type' warnings can be ignored
+```
+
+Command for the admin's rule:
+
+```
+findmnt --verify --tab-file /etc/fstab
+```
+
+The first part of the tool (fstab against `/proc/mounts` and `/proc/swaps`) reads only
+world-readable files and runs as the login user.
 
 ## Limits
 

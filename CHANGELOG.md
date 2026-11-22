@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 ### Added
+- `get_fstab`: `/etc/fstab` as written, comments included.
+- `get_mount_problems`: checks every `/etc/fstab` entry against what is mounted now and
+  prints one line per problem, then a summary (`no problems found (N fstab entries
+  checked)` on a healthy host): `NOT MOUNTED`, `READ-ONLY` (configured read-write but
+  mounted read-only, usually after I/O errors), `SWAP NOT ACTIVE` and `SWAP NOT FOUND`.
+  Entries are matched by mount point, so `UUID=` and `LABEL=` sources need no
+  resolving; `noauto` entries are skipped. Then `findmnt --verify` says whether each
+  entry would still mount on the next boot; it runs through `sudo -n` / `doas -n` when
+  the login user is not root and falls back to the login user, with a
+  `# not run as root` line, if that is refused. Where findmnt has no `--verify`
+  (Alpine, util-linux < 2.29) that part says it was not checked. Problems are part of
+  the answer: the call exits 0 and `ok` is true. See
+  [decision_records/as_root.md](decision_records/as_root.md).
 - `get_iostat`: disk I/O and CPU usage now (`iostat -x -m -y <interval> <samples>`,
   3 reports 1 second apart by default): r/s, w/s, MB/s, r_await, w_await, aqu-sz and
   %util per device; loop and ram devices are left out.

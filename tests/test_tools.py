@@ -62,6 +62,8 @@ import mcp_ssh
     (mcp_ssh.get_listening_sockets, mcp_ssh.LISTENING_SOCKETS_CMD),
     (mcp_ssh.get_process_files, mcp_ssh.PROCESS_FILES_CMD),
     (mcp_ssh.get_journalctl_disk_usage, mcp_ssh.JOURNAL_DISK_USAGE_CMD),
+    (mcp_ssh.get_fstab, "cat /etc/fstab"),
+    (mcp_ssh.get_mount_problems, mcp_ssh.mount_problems_cmd()),
 ])
 def test_simple_tool_sends_correct_command(tool_func, expected_cmd, mock_run_ssh_command):
     tool_func(host="testhost", user="testuser")
@@ -584,6 +586,172 @@ def test_mpstat_without_sysstat_missing_proc_fails(tmp_path):
     bin_dir, _, _ = _sampling_env(tmp_path)
     result = _run(mcp_ssh.mpstat_cmd(1, 1, str(tmp_path / "missing")), bin_dir)
     assert result.returncode != 0
+
+
+# ============================================================
+# get_mount_problems — fstab against /proc/mounts and /proc/swaps, then findmnt --verify
+# ============================================================
+
+MOUNTS = """/dev/vda1 / ext4 rw,relatime 0 0
+proc /proc proc rw,nosuid 0 0
+/dev/vda16 /boot ext4 rw,relatime 0 0
+/dev/vdc /srv/my\\040data ext4 rw,relatime 0 0
+/dev/vdd /data ext4 ro,relatime 0 0
+/dev/vde /ro-wanted ext4 ro,relatime 0 0
+/dev/vdf /stacked ext4 ro,relatime 0 0
+/dev/vdg /stacked ext4 rw,relatime 0 0
+"""
+SWAPS_HEADER = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
+NO_VERIFY = ("# findmnt --verify is not available on this host (it needs util-linux 2.29+): "
+             "fstab sources, mount points and filesystem types were not checked")
+VERIFY_HEADER = "# findmnt --verify: would every fstab entry mount on the next boot? ([E] error, [W] warning)"
+
+
+def _run_mount_problems(tmp_path, fstab, mounts=MOUNTS, swaps=SWAPS_HEADER, programs=None, uid="0"):
+    """Runs the command against fake fstab, mounts, swaps and /dev/disk, with only the given
+    fake programs (name -> script body) and the real tools it uses on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("awk", "cat", "tr", "readlink", "grep"):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    for name, body in {"id": f"echo {uid}", **(programs or {})}.items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    swapfile = tmp_path / "swapfile"
+    swapfile.write_text("")
+    by_uuid = tmp_path / "dev_disk" / "by-uuid"
+    by_uuid.mkdir(parents=True)
+    (by_uuid / "aaaa-swap").symlink_to(swapfile)
+    files = {"fstab": fstab, "mounts": mounts, "swaps": swaps}
+    for name, content in files.items():
+        if content is not None:
+            (tmp_path / name).write_text(content.replace("@SWAPFILE@", str(swapfile)))
+    cmd = mcp_ssh.mount_problems_cmd(
+        str(tmp_path / "fstab"), str(tmp_path / "mounts"), str(tmp_path / "swaps"), str(tmp_path / "dev_disk"),
+    )
+    return subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True, env={"PATH": str(bin_dir)})
+
+
+def test_mount_problems_finds_each_kind_of_problem(tmp_path):
+    fstab = (
+        "# comment\n\n"
+        "LABEL=root / ext4 defaults 0 1\n"
+        "LABEL=BOOT /boot/ ext4 defaults 0 2\n"          # trailing slash still matches
+        "UUID=1 /srv/my\\040data ext4 defaults 0 2\n"    # escaped space matches /proc/mounts
+        "UUID=2 /missing ext4 defaults 0 2\n"
+        "UUID=3 /optional ext4 defaults,nofail 0 2\n"
+        "/dev/sr0 /media/cd iso9660 noauto,ro 0 0\n"
+        "UUID=4 /data ext4 defaults 0 2\n"               # mounted ro, wanted rw
+        "UUID=5 /ro-wanted ext4 ro 0 2\n"                # mounted ro, wanted ro
+        "UUID=6 /stacked ext4 defaults 0 2\n"            # the mount on top is rw
+        "UUID=aaaa-swap none swap sw 0 0\n"              # resolves to a swap that is off
+        "UUID=gone none swap sw 0 0\n"
+        "@SWAPFILE@ none swap sw 0 0\n"                  # the same swap file by path
+        "/x /y ignore defaults 0 0\n"
+    )
+    result = _run_mount_problems(tmp_path, fstab)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "# fstab entries compared with what is mounted now (/proc/mounts, /proc/swaps)",
+        "NOT MOUNTED: UUID=2 /missing ext4 defaults",
+        "NOT MOUNTED (nofail: the boot went on without it): UUID=3 /optional ext4 defaults,nofail",
+        "READ-ONLY: UUID=4 /data ext4 defaults -- configured read-write but mounted read-only, "
+        "usually remounted after I/O errors (errors=remount-ro): /dev/vdd /data ext4 ro,relatime 0 0",
+        "SWAP NOT ACTIVE: UUID=aaaa-swap none swap sw",
+        "SWAP NOT FOUND: UUID=gone none swap sw -- UUID=gone is not an existing device or file",
+        f"SWAP NOT ACTIVE: {tmp_path}/swapfile none swap sw",
+        "6 problem(s) (11 fstab entries checked; 2 skipped: noauto, type ignore or no mount point)",
+        "",
+        NO_VERIFY,
+    ]
+
+
+def test_mount_problems_active_swap_is_fine(tmp_path):
+    fstab = "LABEL=root / ext4 defaults 0 1\nUUID=aaaa-swap none swap sw 0 0\n"
+    swaps = SWAPS_HEADER + "@SWAPFILE@                               file\t\t1024\t\t0\t\t-2\n"
+    result = _run_mount_problems(tmp_path, fstab, swaps=swaps)
+    assert result.returncode == 0, result.stderr
+    assert "no problems found (2 fstab entries checked)\n" in result.stdout
+
+
+def test_mount_problems_healthy_host(tmp_path):
+    result = _run_mount_problems(tmp_path, "LABEL=root / ext4 defaults 0 1\n", swaps=None)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[1] == "no problems found (1 fstab entries checked)"
+
+
+def test_mount_problems_comments_only_fstab(tmp_path):
+    result = _run_mount_problems(tmp_path, "# nothing here\n\n   \n")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[1] == "no problems found (0 fstab entries checked)"
+
+
+def test_mount_problems_without_fstab(tmp_path):
+    result = _run_mount_problems(tmp_path, None)
+    assert result.returncode == 0
+    assert result.stdout == f"# {tmp_path}/fstab does not exist: nothing is configured to be mounted at boot\n"
+
+
+def test_mount_problems_unreadable_mounts_fails(tmp_path):
+    result = _run_mount_problems(tmp_path, "LABEL=root / ext4 defaults 0 1\n", mounts=None)
+    assert result.returncode != 0
+
+
+FINDMNT_FAKE = (
+    'if [ "$1" = --help ]; then echo " -x, --verify  verify mount table content"; exit 0; fi; '
+    'echo "findmnt $* uid=$(id -u)"; echo "0 parse errors, 1 error, 0 warnings" >&2; exit 1'
+)
+SUDO_AS_ROOT = 'shift; PATH="$PATH" "$@"'
+
+
+def _verify_part(result):
+    return result.stdout.split("\n\n", 1)[1].splitlines()
+
+
+def test_mount_problems_verify_as_root(tmp_path):
+    result = _run_mount_problems(tmp_path, "LABEL=root / ext4 defaults 0 1\n", programs={"findmnt": FINDMNT_FAKE})
+    assert result.returncode == 0, result.stderr
+    assert _verify_part(result) == [
+        VERIFY_HEADER,
+        f"findmnt --verify --tab-file {tmp_path}/fstab uid=0",
+        "0 parse errors, 1 error, 0 warnings",
+    ]
+
+
+def test_mount_problems_verify_through_sudo_keeps_findmnt_errors(tmp_path):
+    # findmnt exits 1 for the problems it finds: that is its answer, not a sudo refusal
+    result = _run_mount_problems(tmp_path, "LABEL=root / ext4 defaults 0 1\n", uid="1000", programs={
+        "findmnt": FINDMNT_FAKE, "sudo": 'shift; echo "via sudo: $*"; exit 1',
+    })
+    assert result.returncode == 0, result.stderr
+    assert _verify_part(result) == [VERIFY_HEADER, f"via sudo: findmnt --verify --tab-file {tmp_path}/fstab"]
+
+
+@pytest.mark.parametrize("programs", [
+    {"sudo": "echo 'sudo: a password is required' >&2; exit 1"},
+    {"doas": "echo 'doas: Operation not permitted' >&2; exit 1"},
+    {},
+])
+def test_mount_problems_verify_falls_back_to_login_user(programs, tmp_path):
+    result = _run_mount_problems(tmp_path, "LABEL=root / ext4 defaults 0 1\n", uid="1000",
+                                 programs={"findmnt": FINDMNT_FAKE, **programs})
+    assert result.returncode == 0, result.stderr
+    assert _verify_part(result) == [
+        VERIFY_HEADER,
+        mcp_ssh.MOUNT_PROBLEMS_VERIFY_PLAIN_NOTE,
+        f"findmnt --verify --tab-file {tmp_path}/fstab uid=1000",
+        "0 parse errors, 1 error, 0 warnings",
+    ]
+    assert "password is required" not in result.stdout
+    assert "not permitted" not in result.stdout
+
+
+def test_mount_problems_old_findmnt_without_verify(tmp_path):
+    result = _run_mount_problems(tmp_path, "LABEL=root / ext4 defaults 0 1\n",
+                                 programs={"findmnt": "echo ' -s, --fstab  search in static table'"})
+    assert result.returncode == 0, result.stderr
+    assert _verify_part(result) == [NO_VERIFY]
 
 
 # ============================================================

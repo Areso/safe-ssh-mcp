@@ -1687,6 +1687,161 @@ def get_mounts(
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
+def get_fstab(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Returns /etc/fstab of a remote Linux host via SSH as written, comments included: the
+    filesystems and swap configured to be mounted at boot, with their sources (UUID=, LABEL=
+    or a device), mount points, types and options (noauto, nofail, ro, ...).
+    What is mounted now is get_mounts; to find fstab entries that are not mounted, mounted
+    read-only by mistake or would fail on the next boot, use get_mount_problems.
+    """
+    cmd = "cat /etc/fstab"
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+MOUNT_PROBLEMS_VERIFY_PLAIN_NOTE = (
+    "# not run as root (no sudo -n / doas -n access): on-disk filesystem types were not "
+    "checked, so 'cannot detect on-disk filesystem type' warnings can be ignored"
+)
+# Part 1: every fstab entry is looked up in /proc/mounts (by mount point, so UUID= and
+# LABEL= need no resolving) or, for swap, in /proc/swaps. Mount points are compared as
+# written: both files escape spaces as \040. Part 2: findmnt --verify, where it exists.
+# Problems are reported in the output and the command exits 0: a host with problems is
+# a correct answer, not a failed call.
+# Plain sh (BusyBox ash too). The placeholders are replaced by mount_problems_cmd.
+MOUNT_PROBLEMS_SCRIPT = r"""fstab=@FSTAB@
+if [ ! -e "$fstab" ]; then echo "# $fstab does not exist: nothing is configured to be mounted at boot"; exit 0; fi
+entries=$(awk '!/^[ \t]*(#|$)/ { print $1 "\t" $2 "\t" $3 "\t" $4 }' "$fstab") || exit
+mounts=$(cat @MOUNTS@) || exit
+swaps=$(awk 'NR > 1 { print $1 }' @SWAPS@ 2>/dev/null)
+tab=$(printf '\t')
+checked=0; skipped=0; problems=0
+problem() { problems=$((problems + 1)); echo "$1"; }
+echo "# fstab entries compared with what is mounted now (/proc/mounts, /proc/swaps)"
+while IFS="$tab" read -r src target type opts; do
+    [ -n "$src" ] || continue
+    entry="$src $target $type $opts"
+    case ",$opts," in *,noauto,*) skipped=$((skipped + 1)); continue ;; esac
+    [ "$type" = ignore ] && { skipped=$((skipped + 1)); continue; }
+    case ",$opts," in *,nofail,*) nofail=" (nofail: the boot went on without it)" ;; *) nofail= ;; esac
+    if [ "$type" = swap ]; then
+        checked=$((checked + 1))
+        spec=$(printf '%s' "$src" | tr -d '"')
+        case "$spec" in
+            UUID=*) dev=@DEV_DISK@/by-uuid/${spec#UUID=} ;;
+            LABEL=*) dev=@DEV_DISK@/by-label/${spec#LABEL=} ;;
+            PARTUUID=*) dev=@DEV_DISK@/by-partuuid/${spec#PARTUUID=} ;;
+            PARTLABEL=*) dev=@DEV_DISK@/by-partlabel/${spec#PARTLABEL=} ;;
+            *) dev=$spec ;;
+        esac
+        real=$(readlink -f "$dev" 2>/dev/null)
+        if [ -z "$real" ] || [ ! -e "$real" ]; then
+            problem "SWAP NOT FOUND$nofail: $entry -- $spec is not an existing device or file"
+            continue
+        fi
+        active=
+        for s in $swaps; do [ "$(readlink -f "$s" 2>/dev/null)" = "$real" ] && active=1; done
+        [ -n "$active" ] || problem "SWAP NOT ACTIVE$nofail: $entry"
+        continue
+    fi
+    case "$target" in /*) ;; *) skipped=$((skipped + 1)); continue ;; esac
+    checked=$((checked + 1))
+    # the last match is the mount on top, the one in use
+    mounted=$(printf '%s\n' "$mounts" | T="$target" awk '
+        function norm(p) { if (p != "/") sub(/\/+$/, "", p); return p }
+        BEGIN { t = norm(ENVIRON["T"]) }
+        norm($2) == t { line = $0 } END { print line }')
+    if [ -z "$mounted" ]; then problem "NOT MOUNTED$nofail: $entry"; continue; fi
+    case ",$opts," in *,ro,*) continue ;; esac
+    mounted_opts=$(printf '%s\n' "$mounted" | awk '{ print $4 }')
+    case ",$mounted_opts," in
+        *,ro,*) problem "READ-ONLY: $entry -- configured read-write but mounted read-only, usually remounted after I/O errors (errors=remount-ro): $mounted" ;;
+    esac
+done <<EOF
+$entries
+EOF
+summary="$checked fstab entries checked"
+[ "$skipped" -gt 0 ] && summary="$summary; $skipped skipped: noauto, type ignore or no mount point"
+if [ "$problems" -eq 0 ]; then echo "no problems found ($summary)"; else echo "$problems problem(s) ($summary)"; fi
+echo
+if command -v findmnt >/dev/null 2>&1 && findmnt --help 2>&1 | grep -q -- --verify; then
+    echo "# findmnt --verify: would every fstab entry mount on the next boot? ([E] error, [W] warning)"
+    @AS_ROOT_PREFIX@
+    verified=
+    if [ -n "$AS_ROOT" ]; then
+        out=$($AS_ROOT findmnt --verify --tab-file "$fstab" 2>&1)
+        # a refusal of sudo/doas, not findmnt's answer (findmnt exits 1 for problems it finds)
+        case "$out" in sudo:*|doas:*) ;; *) verified=1 ;; esac
+    fi
+    if [ -z "$verified" ]; then
+        [ "$(id -u)" = 0 ] || echo @PLAIN_NOTE@
+        out=$(findmnt --verify --tab-file "$fstab" 2>&1)
+    fi
+    printf '%s\n' "$out"
+else
+    echo "# findmnt --verify is not available on this host (it needs util-linux 2.29+): fstab sources, mount points and filesystem types were not checked"
+fi"""
+
+def mount_problems_cmd(
+    fstab: str = "/etc/fstab",
+    mounts: str = "/proc/mounts",
+    swaps: str = "/proc/swaps",
+    dev_disk: str = "/dev/disk",
+) -> str:
+    """Builds the get_mount_problems command. The paths are there for the tests."""
+    replacements = {
+        "@FSTAB@": shlex.quote(fstab),
+        "@MOUNTS@": shlex.quote(mounts),
+        "@SWAPS@": shlex.quote(swaps),
+        "@DEV_DISK@": shlex.quote(dev_disk),
+        "@AS_ROOT_PREFIX@": AS_ROOT_PREFIX,
+        "@PLAIN_NOTE@": shlex.quote(MOUNT_PROBLEMS_VERIFY_PLAIN_NOTE),
+    }
+    cmd = MOUNT_PROBLEMS_SCRIPT
+    for placeholder, value in replacements.items():
+        cmd = cmd.replace(placeholder, value)
+    return cmd
+
+@mcp.tool()
+def get_mount_problems(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Finds filesystem mount problems on a remote Linux host via SSH, by checking /etc/fstab
+    against what is mounted now. USE THIS TOOL when a filesystem or disk is missing, the host
+    did not come back after a reboot, or writes fail with "Read-only file system".
+    Part 1 prints one line per problem, then a summary ('no problems found (N fstab entries
+    checked)' when all is well):
+      NOT MOUNTED       - configured in fstab but not mounted now;
+      READ-ONLY         - configured read-write but mounted read-only: the kernel usually
+                          remounts a filesystem read-only after I/O errors;
+      SWAP NOT ACTIVE / SWAP NOT FOUND - a configured swap is off, or its device is gone.
+    noauto entries are skipped. "(nofail ...)" means the boot did not wait for it.
+    Part 2 is findmnt --verify: would each entry still mount on the NEXT boot (the source
+    device exists, the mount point exists, the type matches the disk)? An entry can be
+    mounted now and still fail then, e.g. after fstab was edited or a disk was replaced.
+    It runs through sudo -n / doas -n when the login user is not root (only root can read
+    the on-disk filesystem type); if that is not allowed, it runs as the login user after a
+    "# not run as root" line. Where findmnt is missing or too old (e.g. Alpine) part 2 says so.
+    To see the whole fstab use get_fstab; for everything mounted now use get_mounts.
+    """
+    cmd = mount_problems_cmd()
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+@mcp.tool()
 def get_pressure(
     host: str,
     user: str,
