@@ -1731,6 +1731,225 @@ def get_vmstat(
     cmd = "vmstat 1 5"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+# ---- get_iostat / get_mpstat: sysstat, or the same numbers computed from /proc ----
+
+SAMPLES_MAX = 30
+INTERVAL_MAX = 10
+SAMPLES_ERROR = f"Invalid value of samples, should be Integer from 1 to {SAMPLES_MAX}"
+INTERVAL_ERROR = f"Invalid value of interval, should be Integer from 1 to {INTERVAL_MAX} (seconds)"
+# time left for connecting and printing once the sampling is over
+SAMPLING_TIMEOUT_MARGIN_S = 5
+
+def sampling_error(samples: Any, interval: Any, timeout: Any) -> Optional[str]:
+    """Says what is wrong with samples / interval, or returns None when they are valid
+    and the sampling (samples * interval seconds) fits in the timeout."""
+    for value, error in ((samples, SAMPLES_ERROR), (interval, INTERVAL_ERROR)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return error
+    if not 1 <= samples <= SAMPLES_MAX:
+        return SAMPLES_ERROR
+    if not 1 <= interval <= INTERVAL_MAX:
+        return INTERVAL_ERROR
+    needed = samples * interval + SAMPLING_TIMEOUT_MARGIN_S
+    if isinstance(timeout, int) and timeout < needed:
+        return (f"samples={samples} x interval={interval}s takes {samples * interval}s: "
+                f"set timeout to at least {needed}, or ask for fewer samples")
+    return None
+
+# Where sysstat is missing, the tools read the kernel counters themselves: one snapshot,
+# then one more after each interval. Every snapshot starts with an "@" line, then the
+# uptime (to know how long the interval really was), then the files the tool needs.
+# The snapshots are kept in a variable and handed to awk at the end in one go.
+def proc_sampling_cmd(read_counters: str, samples: int, interval: int, proc_dir: str) -> str:
+    snap = f"echo @; cat {shlex.quote(proc_dir + '/uptime')}; {read_counters}"
+    return (
+        f"snaps=$({snap}) || exit; i=0; "
+        f'while [ "$i" -lt {samples} ]; do sleep {interval}; '
+        f'snaps="$snaps\n$({snap})" || exit; i=$((i + 1)); done; '
+    )
+
+# /proc/stat cpu fields: $2 user, $3 nice, $4 system, $5 idle, $6 iowait, $7 irq,
+# $8 softirq, $9 steal, $10 guest, $11 guest_nice. guest is already counted in user and
+# guest_nice in nice, so the total is $2..$9, and user / nice are shown without them,
+# as sysstat does. A counter that went backwards (idle can, on some kernels) counts as 0.
+PROC_CPU_AWK_FUNCTIONS = r"""
+function delta(a, b, name, i,   x) { x = v[b, name, i] - v[a, name, i]; return x > 0 ? x : 0 }
+function cpu_pct(a, b, name,   i, tot) {
+    tot = 0
+    for (i = 2; i <= 9; i++) { p[i] = delta(a, b, name, i); tot += p[i] }
+    p[10] = delta(a, b, name, 10); p[11] = delta(a, b, name, 11)
+    p[2] = p[2] > p[10] ? p[2] - p[10] : 0
+    p[3] = p[3] > p[11] ? p[3] - p[11] : 0
+    for (i = 2; i <= 11; i++) p[i] = tot > 0 ? 100 * p[i] / tot : 0
+    return tot
+}
+"""
+
+IOSTAT_SYSSTAT_FILTER = (
+    # loop and ram devices are noise; repeated blank lines are squeezed into one
+    "awk '/^(loop|ram)[0-9]/ { next } /^$/ { if (blank++) next; print; next } { blank = 0; print }'"
+)
+IOSTAT_PROC_AWK = PROC_CPU_AWK_FUNCTIONS + r"""
+BEGIN { n = split(disks, list, " "); for (i = 1; i <= n; i++) if (list[i] !~ /^(loop|ram)[0-9]/) disk[list[i]] = 1 }
+$1 == "@" { k++; want_uptime = 1; next }
+want_uptime { up[k] = $1; want_uptime = 0; next }
+$1 == "cpu" { for (i = 2; i <= 11; i++) v[k, "all", i] = $i + 0; next }
+($3 in disk) {
+    if (k == 1) order[++nd] = $3
+    for (i = 4; i <= 14; i++) d[k, $3, i] = $i + 0
+}
+function dd(a, b, name, i,   x) { x = d[b, name, i] - d[a, name, i]; return x > 0 ? x : 0 }
+END {
+    for (s = 2; s <= k; s++) {
+        dt = up[s] - up[s - 1]; if (dt <= 0) dt = 0.01
+        cpu_pct(s - 1, s, "all")
+        print "avg-cpu:  %user   %nice %system %iowait  %steal   %idle"
+        printf "         %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f\n\n", p[2], p[3], p[4] + p[7] + p[8], p[6], p[9], p[5]
+        print "Device            r/s     rMB/s r_await     w/s     wMB/s w_await  aqu-sz   %util"
+        for (j = 1; j <= nd; j++) {
+            name = order[j]
+            r = dd(s - 1, s, name, 4); w = dd(s - 1, s, name, 8)
+            util = 100 * dd(s - 1, s, name, 13) / (dt * 1000); if (util > 100) util = 100
+            printf "%-12s %8.2f %9.2f %7.2f %7.2f %9.2f %7.2f %7.2f %7.2f\n", name,
+                r / dt, dd(s - 1, s, name, 6) * 512 / 1048576 / dt, r ? dd(s - 1, s, name, 7) / r : 0,
+                w / dt, dd(s - 1, s, name, 10) * 512 / 1048576 / dt, w ? dd(s - 1, s, name, 11) / w : 0,
+                dd(s - 1, s, name, 14) / (dt * 1000), util
+        }
+        print ""
+    }
+}
+"""
+
+def iostat_cmd(samples: int, interval: int, proc_dir: str = "/proc", sys_block_dir: str = "/sys/block") -> str:
+    """Builds the get_iostat command: sysstat iostat -x, or the same main columns computed
+    from /proc/stat and /proc/diskstats (BusyBox iostat has no await or %util).
+    proc_dir and sys_block_dir are there for the tests."""
+    # the total cpu line is enough here: per-CPU lines are get_mpstat's
+    read_counters = (
+        f"grep '^cpu ' {shlex.quote(proc_dir + '/stat')} && cat {shlex.quote(proc_dir + '/diskstats')}"
+    )
+    proc_header = (
+        "# sysstat is not installed (BusyBox iostat, if any, has no await or %util): "
+        f"computed from /proc/stat and /proc/diskstats, {samples} report(s) {interval}s apart"
+    )
+    return (
+        "export LC_ALL=C S_TIME_FORMAT=ISO; "
+        "if iostat -V 2>&1 | grep -q sysstat; then "
+        f"""out=$(iostat -x -m -y {interval} {samples}) || exit; printf '%s\\n' "$out" | {IOSTAT_SYSSTAT_FILTER}; """
+        f"else echo {shlex.quote(proc_header)}; echo; "
+        f"{proc_sampling_cmd(read_counters, samples, interval, proc_dir)}"
+        f"""printf '%s\\n' "$snaps" | awk -v disks="$(ls {shlex.quote(sys_block_dir)} | tr '\\n' ' ')" """
+        f"{shlex.quote(IOSTAT_PROC_AWK)}; fi"
+    )
+
+@mcp.tool()
+def get_iostat(
+    host: str,
+    user: str,
+    samples: int = 3,
+    interval: int = 1,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Measures disk I/O and CPU usage with iostat -x -m: `samples` reports, each covering
+    `interval` seconds (the since-boot report is skipped, so every number is current).
+    Per device: reads and writes per second (r/s, w/s), MB/s, average wait per request in ms
+    (r_await, w_await), queue length (aqu-sz) and %util (time the device was busy).
+    USE THIS TOOL when the host is slow and vmstat or get_pressure shows I/O wait, to find
+    which disk is saturated (%util near 100, high await). loop and ram devices are left out.
+    The call takes samples x interval seconds; timeout must be at least that plus 5.
+    Where sysstat is not installed (e.g. Alpine), the output starts with a
+    '# sysstat is not installed' line and the same main columns are computed from
+    /proc/stat and /proc/diskstats (whole disks only, no partitions).
+    """
+    error = sampling_error(samples, interval, timeout)
+    if error:
+        return {"ok": False, "error": error}
+    cmd = iostat_cmd(samples, interval)
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+MPSTAT_SYSSTAT_FILTER = (
+    # keeps the banner, one header, the 'all' row of each sample and the whole Average block
+    "awk 'NR == 1 { print; next } "
+    '$1 == "Average:" { if (!avg++) print ""; print; next } '
+    '$2 == "CPU" { if (!hdr++) { print ""; print } next } '
+    "$2 == \"all\" { print }'"
+)
+MPSTAT_PROC_AWK = PROC_CPU_AWK_FUNCTIONS + r"""
+$1 == "@" { k++; want_uptime = 1; next }
+want_uptime { want_uptime = 0; next }
+$1 ~ /^cpu/ {
+    name = $1 == "cpu" ? "all" : substr($1, 4)
+    if (k == 1) order[++n] = name
+    for (i = 2; i <= 11; i++) v[k, name, i] = $i + 0
+}
+function row(label, name, a, b) {
+    if (!cpu_pct(a, b, name)) return
+    printf "%-8s %5s %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f\n", label, name,
+        p[2], p[3], p[4], p[6], p[7], p[8], p[9], p[10], p[11], p[5]
+}
+END {
+    header = "%-8s %5s    %%usr   %%nice    %%sys %%iowait    %%irq   %%soft  %%steal  %%guest  %%gnice   %%idle\n"
+    printf header, "Sample", "CPU"
+    for (s = 2; s <= k; s++) row(s - 1, "all", s - 1, s)
+    print ""
+    printf header, "Average:", "CPU"
+    for (j = 1; j <= n; j++) row("Average:", order[j], 1, k)
+}
+"""
+
+def mpstat_cmd(samples: int, interval: int, proc_dir: str = "/proc") -> str:
+    """Builds the get_mpstat command: sysstat mpstat -P ALL, or the same columns computed
+    from /proc/stat. proc_dir is there for the tests."""
+    read_counters = f"grep '^cpu' {shlex.quote(proc_dir + '/stat')}"
+    proc_header = (
+        "# sysstat is not installed: computed from /proc/stat, "
+        f"{samples} sample(s) {interval}s apart"
+    )
+    return (
+        "export LC_ALL=C S_TIME_FORMAT=ISO; "
+        "if mpstat -V 2>&1 | grep -q sysstat; then "
+        f"""out=$(mpstat -P ALL {interval} {samples}) || exit; printf '%s\\n' "$out" | {MPSTAT_SYSSTAT_FILTER}; """
+        f"else echo {shlex.quote(proc_header)}; "
+        f"{proc_sampling_cmd(read_counters, samples, interval, proc_dir)}"
+        f"""printf '%s\\n' "$snaps" | awk {shlex.quote(MPSTAT_PROC_AWK)}; fi"""
+    )
+
+@mcp.tool()
+def get_mpstat(
+    host: str,
+    user: str,
+    samples: int = 3,
+    interval: int = 1,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Measures CPU usage PER CORE with mpstat -P ALL: `samples` samples, each covering
+    `interval` seconds. Prints the all-CPU row of each sample, then an Average block with one
+    row per CPU: %usr, %nice, %sys, %iowait, %irq, %soft, %steal, %guest, %gnice, %idle.
+    USE THIS TOOL when total CPU looks fine but the host is slow: a single core at 100%
+    (a single-threaded bottleneck, or interrupts all landing on one core) hides in the
+    totals of top and vmstat. High %steal means the hypervisor gives the VM's CPU time to
+    other VMs - it cannot be fixed from inside the VM.
+    The call takes samples x interval seconds; timeout must be at least that plus 5.
+    Where sysstat is not installed (e.g. Alpine), the output starts with a
+    '# sysstat is not installed' line and the same columns are computed from /proc/stat
+    (samples are numbered instead of timed).
+    """
+    error = sampling_error(samples, interval, timeout)
+    if error:
+        return {"ok": False, "error": error}
+    cmd = mpstat_cmd(samples, interval)
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
 BUSYBOX_TOP_HEADER = "# BusyBox: top -b -n 1"
 # captured, not piped, so that a failing top is noticed; with the header line it is 30 lines
 BUSYBOX_TOP_CMD = (
@@ -1762,6 +1981,76 @@ def get_top(
         "top -b -n 2 -d 1 -c -w 512", "top", BUSYBOX_TOP_CMD,
         output_filter=TOP_SECOND_SAMPLE_FILTER,
     )
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+CPU_INFO_NO_LSCPU_HEADER = "# lscpu is not installed: summary of /proc/cpuinfo"
+# The /proc/cpuinfo lines that describe the CPU rather than one core: x86 names first,
+# then the ARM ones (ARM has no "model name"). Each distinct line is printed once.
+CPU_INFO_FIELDS = (
+    "vendor_id", "model name", "cpu family", "model", "stepping", "microcode", "cache size",
+    "physical id", "siblings", "cpu cores", "address sizes",
+    "Hardware", "CPU implementer", "CPU architecture", "CPU variant", "CPU part", "CPU revision", "Model",
+)
+# x86 calls them flags, ARM Features
+CPU_INFO_FLAG_FIELDS = ("flags", "Features")
+# lscpu 2.38+ no longer prints the current frequency, so it is always taken from
+# /proc/cpuinfo, as one line however many CPUs there are. Hosts whose /proc/cpuinfo has
+# no "cpu MHz" (most ARM) get no line.
+CPU_MHZ_SUMMARY = (
+    "awk -F: '/^cpu MHz/ { v = $2 + 0; n++; s += v; if (n == 1 || v < min) min = v; if (v > max) max = v } "
+    'END { if (n) printf "CPU MHz now (/proc/cpuinfo): min %.0f, average %.0f, max %.0f over %d CPUs\\n", '
+    "min, s / n, max, n }'"
+)
+CPUINFO_PATH = "/proc/cpuinfo"
+
+def cpu_info_cmd(include_flags: bool, cpuinfo_path: str = CPUINFO_PATH) -> str:
+    """Builds the get_cpu_info command: lscpu, or a /proc/cpuinfo summary where lscpu is
+    missing (Alpine: it is in util-linux, which BusyBox systems usually lack).
+    cpuinfo_path is there for the tests."""
+    cpuinfo = shlex.quote(cpuinfo_path)
+    fields = CPU_INFO_FIELDS + (CPU_INFO_FLAG_FIELDS if include_flags else ())
+    cpuinfo_summary = (
+        f"awk -v fields={shlex.quote('|'.join(fields))} "
+        "'BEGIN { n = split(fields, f, \"|\"); for (i = 1; i <= n; i++) want[f[i]] = 1 } "
+        "{ k = $0; sub(/[ \\t]*:.*/, \"\", k) } (k in want) && !seen[$0]++' "
+        f"{cpuinfo}"
+    )
+    lscpu_print = """printf '%s\\n' "$out\"""" if include_flags else """printf '%s\\n' "$out" | grep -v '^Flags:'"""
+    return (
+        # C locale: lscpu translates its labels
+        "LC_ALL=C; export LC_ALL; "
+        f"if command -v lscpu >/dev/null 2>&1; then out=$(lscpu) || exit; {lscpu_print}; "
+        f"else echo {shlex.quote(CPU_INFO_NO_LSCPU_HEADER)}; "
+        """echo "Architecture: $(uname -m)"; echo "CPU(s): $(grep -c '^processor' """ f"{cpuinfo})\"; "
+        f"{cpuinfo_summary} || exit; fi; "
+        f"{CPU_MHZ_SUMMARY} {cpuinfo}"
+    )
+
+@mcp.tool()
+def get_cpu_info(
+    host: str,
+    user: str,
+    include_flags: bool = False,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Describes the CPUs of a remote Linux host via SSH (lscpu): architecture, model name,
+    number of CPUs, sockets, cores and threads per core, caches, NUMA nodes, hypervisor
+    and CPU vulnerability mitigations. The last line gives the current frequency
+    ('CPU MHz now (/proc/cpuinfo): min, average, max over N CPUs'); it is missing on
+    hosts that do not report it (most ARM).
+    The CPU flags (avx2, aes, ...) are left out unless include_flags=True: the line is long.
+    Where lscpu is not installed (e.g. Alpine), the output starts with a
+    '# lscpu is not installed' line and lists the distinct model lines of /proc/cpuinfo
+    (model name, cache size, cpu cores, ...) instead, with the field names of /proc/cpuinfo.
+    """
+    if not isinstance(include_flags, bool):
+        return {"ok": False, "error": "Invalid value of include_flags, should be Boolean"}
+    cmd = cpu_info_cmd(include_flags)
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()

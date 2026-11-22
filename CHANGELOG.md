@@ -10,6 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 ### Added
+- `get_iostat`: disk I/O and CPU usage now (`iostat -x -m -y <interval> <samples>`,
+  3 reports 1 second apart by default): r/s, w/s, MB/s, r_await, w_await, aqu-sz and
+  %util per device; loop and ram devices are left out.
+- `get_mpstat`: CPU usage per core (`mpstat -P ALL <interval> <samples>`): the all-CPU
+  row of each sample, then an Average row per CPU, including %steal.
+- Both need sysstat. Where it is missing (Alpine; BusyBox iostat has no await or
+  %util), the output starts with a `# sysstat is not installed` line and the same
+  columns are computed from `/proc/stat` and `/proc/diskstats`, so they work on every
+  host. `samples` (1-30) and `interval` (1-10 s) are validated, and a sampling that
+  would not fit in `timeout` is refused before connecting.
+- `get_cpu_info`: the CPUs of the host (`lscpu`): model, CPU, socket, core and thread
+  counts, caches, NUMA nodes, hypervisor, vulnerability mitigations, and a last line
+  with the current frequency from `/proc/cpuinfo` (min, average and max over all CPUs;
+  lscpu 2.38+ no longer prints it). The `Flags:` line is left out unless
+  `include_flags=True`. Where lscpu is not installed (Alpine), the output starts with
+  `# lscpu is not installed: summary of /proc/cpuinfo` and lists each distinct model line
+  of `/proc/cpuinfo` once.
 - `get_journalctl_disk_usage`: how much disk space the systemd journal takes
   (`journalctl --disk-usage`). Runs through `sudo -n` / `doas -n` when the login user is
   not root, so every journal is counted, and falls back to the login user, with a

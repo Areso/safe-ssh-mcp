@@ -21,7 +21,10 @@ A few examples from each group; `<...>` marks a validated parameter.
 **CPU, memory and processes**
 - get_top : `top -b -n 2 -d 1 -c -w 512`, second sample, first 30 lines
 - get_vmstat : `vmstat 1 5`
+- get_mpstat : `mpstat -P ALL 1 3` (per-core CPU), or computed from `/proc/stat` without sysstat
+- get_iostat : `iostat -x -m -y 1 3` (per-disk await and %util), or computed from `/proc/diskstats` without sysstat
 - get_pressure : `cat /proc/pressure/{cpu,io,memory}`
+- get_cpu_info : `lscpu` (without flags), or a summary of `/proc/cpuinfo` where lscpu is missing
 
 **Systemd and logs**
 - get_systemd_list_failed : `systemctl list-units --state=failed --no-pager`

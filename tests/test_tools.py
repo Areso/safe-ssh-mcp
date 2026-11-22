@@ -183,6 +183,410 @@ def test_journal_errors_non_bool_current_boot_rejected(mock_run_ssh_command):
 
 
 # ============================================================
+# get_cpu_info — lscpu, or a /proc/cpuinfo summary without it
+# ============================================================
+
+X86_CPUINFO = """processor\t: 0
+vendor_id\t: GenuineIntel
+model name\t: Test CPU @ 2.0GHz
+cpu MHz\t\t: 2000.000
+cache size\t: 4096 KB
+physical id\t: 0
+cpu cores\t: 2
+flags\t\t: fpu sse avx2
+bugs\t\t: spectre_v1
+
+processor\t: 1
+vendor_id\t: GenuineIntel
+model name\t: Test CPU @ 2.0GHz
+cpu MHz\t\t: 3000.000
+cache size\t: 4096 KB
+physical id\t: 0
+cpu cores\t: 2
+flags\t\t: fpu sse avx2
+bugs\t\t: spectre_v1
+"""
+
+ARM_CPUINFO = """processor\t: 0
+BogoMIPS\t: 48.00
+Features\t: fp asimd crc32
+CPU implementer\t: 0x41
+CPU part\t: 0xd0c
+"""
+
+LSCPU_FAKE = "printf 'Architecture: x86_64\\nModel name: Test CPU\\nFlags: fpu sse avx2\\n'"
+
+
+def _run_cpu_info_cmd(tmp_path, cpuinfo, programs=None, include_flags=False):
+    """Runs the command against a fake /proc/cpuinfo, with only the given fake programs
+    (name -> script body) and the real awk, grep and uname on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("awk", "grep", "uname"):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    for name, body in (programs or {}).items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    cpuinfo_path = tmp_path / "cpuinfo"
+    cpuinfo_path.write_text(cpuinfo)
+    cmd = mcp_ssh.cpu_info_cmd(include_flags, str(cpuinfo_path))
+    return subprocess.run(
+        ["/bin/bash", "-c", cmd], capture_output=True, text=True, env={"PATH": str(bin_dir)},
+    )
+
+
+def test_cpu_info_sends_command(mock_run_ssh_command):
+    mcp_ssh.get_cpu_info(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.cpu_info_cmd(False)
+    mcp_ssh.get_cpu_info(host="h", user="u", include_flags=True)
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.cpu_info_cmd(True)
+
+
+@pytest.mark.parametrize("include_flags", ["yes", 1, None])
+def test_cpu_info_non_bool_include_flags_rejected(include_flags, mock_run_ssh_command):
+    result = mcp_ssh.get_cpu_info(host="h", user="u", include_flags=include_flags)
+    assert result["ok"] is False
+    mock_run_ssh_command.assert_not_called()
+
+
+def test_cpu_info_lscpu_without_flags(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, X86_CPUINFO, {"lscpu": LSCPU_FAKE})
+    assert result.returncode == 0
+    assert result.stdout == (
+        "Architecture: x86_64\nModel name: Test CPU\n"
+        "CPU MHz now (/proc/cpuinfo): min 2000, average 2500, max 3000 over 2 CPUs\n"
+    )
+
+
+def test_cpu_info_lscpu_with_flags(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, X86_CPUINFO, {"lscpu": LSCPU_FAKE}, include_flags=True)
+    assert result.returncode == 0
+    assert "Flags: fpu sse avx2\n" in result.stdout
+
+
+def test_cpu_info_lscpu_runs_in_c_locale(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, X86_CPUINFO, {"lscpu": 'echo "LC_ALL=$LC_ALL"'})
+    assert result.stdout.startswith("LC_ALL=C\n")
+
+
+def test_cpu_info_lscpu_failure_is_not_hidden(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, X86_CPUINFO, {"lscpu": "echo 'lscpu: boom' >&2; exit 3"})
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert "lscpu: boom" in result.stderr
+
+
+def test_cpu_info_without_lscpu_summarizes_cpuinfo(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, X86_CPUINFO)
+    assert result.returncode == 0
+    lines = result.stdout.splitlines()
+    assert lines[0] == mcp_ssh.CPU_INFO_NO_LSCPU_HEADER
+    assert lines[1].startswith("Architecture: ")
+    assert lines[2:] == [
+        "CPU(s): 2",
+        "vendor_id\t: GenuineIntel",
+        "model name\t: Test CPU @ 2.0GHz",
+        "cache size\t: 4096 KB",
+        "physical id\t: 0",
+        "cpu cores\t: 2",
+        "CPU MHz now (/proc/cpuinfo): min 2000, average 2500, max 3000 over 2 CPUs",
+    ]
+
+
+def test_cpu_info_without_lscpu_with_flags(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, X86_CPUINFO, include_flags=True)
+    assert result.returncode == 0
+    assert result.stdout.count("flags\t\t: fpu sse avx2\n") == 1
+    assert "bugs" not in result.stdout
+
+
+def test_cpu_info_arm_without_lscpu(tmp_path):
+    result = _run_cpu_info_cmd(tmp_path, ARM_CPUINFO, include_flags=True)
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[2:] == [
+        "CPU(s): 1",
+        "Features\t: fp asimd crc32",
+        "CPU implementer\t: 0x41",
+        "CPU part\t: 0xd0c",
+    ]
+    assert "MHz" not in result.stdout
+
+
+def test_cpu_info_unreadable_cpuinfo_fails(tmp_path):
+    _run_cpu_info_cmd(tmp_path, X86_CPUINFO)  # only to set up the fake bin directory
+    cmd = mcp_ssh.cpu_info_cmd(False, str(tmp_path / "missing"))
+    result = subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True,
+                            env={"PATH": str(tmp_path / "bin")})
+    assert result.returncode != 0
+
+
+# ============================================================
+# get_iostat / get_mpstat — sysstat, or computed from /proc
+# ============================================================
+
+def _sampling_env(tmp_path, programs=None, snapshots=None):
+    """Sets up a fake bin dir with only the given fake programs (name -> script body) and
+    the real tools the commands use. With snapshots (list of {file name: content}), the fake
+    proc dir starts at the first one and the fake sleep moves it on to the next."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("awk", "grep", "cat", "tr", "ls", "cp"):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    programs = dict(programs or {})
+    proc_dir = tmp_path / "proc"
+    sys_block = tmp_path / "sys_block"
+    proc_dir.mkdir()
+    sys_block.mkdir()
+    for name in ("vda", "vdb", "loop0"):
+        (sys_block / name).mkdir()
+    if snapshots:
+        for i, snap in enumerate(snapshots):
+            snap_dir = tmp_path / f"snap{i}"
+            snap_dir.mkdir()
+            for name, content in snap.items():
+                (snap_dir / name).write_text(content)
+                if i == 0:
+                    (proc_dir / name).write_text(content)
+        (tmp_path / "n").write_text("0")
+        programs.setdefault("sleep", (
+            f"n=$(cat {tmp_path}/n); n=$((n + 1)); echo $n > {tmp_path}/n; "
+            f"cp {tmp_path}/snap$n/* {proc_dir}/"
+        ))
+    for name, body in programs.items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    return bin_dir, str(proc_dir), str(sys_block)
+
+
+def _run(cmd, bin_dir):
+    return subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True,
+                          env={"PATH": str(bin_dir)})
+
+
+@pytest.mark.parametrize("tool, builder", [
+    (mcp_ssh.get_iostat, mcp_ssh.iostat_cmd),
+    (mcp_ssh.get_mpstat, mcp_ssh.mpstat_cmd),
+])
+def test_sampling_tools_send_command(tool, builder, mock_run_ssh_command):
+    tool(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == builder(3, 1)
+    tool(host="h", user="u", samples=5, interval=2, timeout=30)
+    assert mock_run_ssh_command.call_args[0][2] == builder(5, 2)
+
+
+@pytest.mark.parametrize("tool", [mcp_ssh.get_iostat, mcp_ssh.get_mpstat])
+@pytest.mark.parametrize("kwargs, expected", [
+    ({"samples": 0}, "samples"),
+    ({"samples": 31}, "samples"),
+    ({"samples": True}, "samples"),
+    ({"samples": "3"}, "samples"),
+    ({"interval": 0}, "interval"),
+    ({"interval": 11}, "interval"),
+    ({"interval": 1.5}, "interval"),
+    ({"samples": 10, "interval": 2}, "set timeout to at least 25"),
+])
+def test_sampling_tools_invalid_args_rejected(tool, kwargs, expected, mock_run_ssh_command):
+    result = tool(host="h", user="u", **kwargs)
+    assert result["ok"] is False
+    assert expected in result["error"]
+    mock_run_ssh_command.assert_not_called()
+
+
+def test_sampling_tools_long_sampling_allowed_with_larger_timeout(mock_run_ssh_command):
+    mcp_ssh.get_iostat(host="h", user="u", samples=10, interval=2, timeout=25)
+    mock_run_ssh_command.assert_called_once()
+
+
+SYSSTAT_V = 'if [ "$1" = -V ]; then echo "sysstat version 12.6.1"; exit 0; fi; '
+
+
+def test_iostat_sysstat_drops_loop_devices_and_squeezes_blank_lines(tmp_path):
+    bin_dir, _, _ = _sampling_env(tmp_path, {"iostat": SYSSTAT_V + (
+        'echo "args: $* LC_ALL=$LC_ALL S_TIME_FORMAT=$S_TIME_FORMAT"; echo; echo; '
+        "echo 'Device r/s'; echo 'loop0 0.00'; echo 'ram0 0.00'; echo 'vda 1.00'; echo; echo; echo 'vdb 0.00'"
+    )})
+    result = _run(mcp_ssh.iostat_cmd(2, 1), bin_dir)
+    assert result.returncode == 0
+    assert result.stdout == (
+        "args: -x -m -y 1 2 LC_ALL=C S_TIME_FORMAT=ISO\n\nDevice r/s\nvda 1.00\n\nvdb 0.00\n"
+    )
+
+
+def test_iostat_sysstat_failure_is_not_hidden(tmp_path):
+    bin_dir, _, _ = _sampling_env(tmp_path, {"iostat": SYSSTAT_V + "echo 'iostat: boom' >&2; exit 2"})
+    result = _run(mcp_ssh.iostat_cmd(2, 1), bin_dir)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "iostat: boom" in result.stderr
+
+
+IOSTAT_SNAPSHOTS = [
+    {
+        "uptime": "100.00 50.00\n",
+        "stat": "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0 0 0\nintr 1 2 3\n",
+        "diskstats": (
+            "   7       0 loop0 1 0 8 1 0 0 0 0 0 1 1\n"
+            " 253       0 vda 10 0 80 10 20 0 160 40 0 100 50\n"
+            " 253       1 vda1 10 0 80 10 20 0 160 40 0 100 50\n"
+            " 253      16 vdb 5 0 40 5 0 0 0 0 0 5 5\n"
+        ),
+    },
+    {
+        # 2 seconds later
+        "uptime": "102.00 51.00\n",
+        # user +100, system +30, irq +10, softirq +10, idle +50: 200 jiffies
+        "stat": "cpu  200 0 130 850 0 10 10 0 0 0\ncpu0 200 0 130 850 0 10 10 0 0 0\nintr 1 2 3\n",
+        "diskstats": (
+            "   7       0 loop0 900 0 8000 900 0 0 0 0 0 900 900\n"
+            # reads +20 (4096 sectors, 100 ms), writes +40 (8192 sectors, 40 ms),
+            # busy +1000 ms, weighted +3000 ms
+            " 253       0 vda 30 0 4176 110 60 0 8352 80 0 1100 3050\n"
+            " 253       1 vda1 999 0 999 999 999 0 999 999 0 999 999\n"
+            " 253      16 vdb 5 0 40 5 0 0 0 0 0 5 5\n"
+        ),
+    },
+]
+IOSTAT_ROW = "%-12s %8.2f %9.2f %7.2f %7.2f %9.2f %7.2f %7.2f %7.2f"
+
+
+def test_iostat_without_sysstat_computes_from_proc(tmp_path):
+    bin_dir, proc_dir, sys_block = _sampling_env(tmp_path, snapshots=IOSTAT_SNAPSHOTS)
+    result = _run(mcp_ssh.iostat_cmd(1, 1, proc_dir, sys_block), bin_dir)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == (
+        "# sysstat is not installed (BusyBox iostat, if any, has no await or %util): "
+        "computed from /proc/stat and /proc/diskstats, 1 report(s) 1s apart"
+    )
+    assert lines[2:] == [
+        "avg-cpu:  %user   %nice %system %iowait  %steal   %idle",
+        "         %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f" % (50, 0, 25, 0, 0, 25),
+        "",
+        "Device            r/s     rMB/s r_await     w/s     wMB/s w_await  aqu-sz   %util",
+        # vda1 is a partition (not in /sys/block) and loop0 is left out
+        IOSTAT_ROW % ("vda", 10, 1, 5, 20, 2, 1, 1.5, 50),
+        IOSTAT_ROW % ("vdb", 0, 0, 0, 0, 0, 0, 0, 0),
+        "",
+    ]
+
+
+def test_iostat_busybox_iostat_uses_proc(tmp_path):
+    bin_dir, proc_dir, sys_block = _sampling_env(tmp_path, {
+        "iostat": "echo 'iostat: unrecognized option: V' >&2; echo 'BusyBox v1.37.0' >&2; exit 1",
+    }, snapshots=IOSTAT_SNAPSHOTS)
+    result = _run(mcp_ssh.iostat_cmd(1, 1, proc_dir, sys_block), bin_dir)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("# sysstat is not installed")
+
+
+def test_iostat_without_sysstat_one_report_per_sample(tmp_path):
+    snapshots = IOSTAT_SNAPSHOTS + [{**IOSTAT_SNAPSHOTS[1], "uptime": "104.00 52.00\n"}]
+    bin_dir, proc_dir, sys_block = _sampling_env(tmp_path, snapshots=snapshots)
+    result = _run(mcp_ssh.iostat_cmd(2, 1, proc_dir, sys_block), bin_dir)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("avg-cpu:") == 2
+    # nothing changed in the second interval
+    assert IOSTAT_ROW % ("vda", 0, 0, 0, 0, 0, 0, 0, 0) in result.stdout
+
+
+def test_iostat_without_sysstat_missing_proc_fails(tmp_path):
+    bin_dir, _, sys_block = _sampling_env(tmp_path)
+    result = _run(mcp_ssh.iostat_cmd(1, 1, str(tmp_path / "missing"), sys_block), bin_dir)
+    assert result.returncode != 0
+
+
+MPSTAT_SYSSTAT_OUTPUT = """Linux 6.8.0 (host) 	2026-11-22 	_x86_64_	(2 CPU)
+
+15:42:01     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+15:42:02     all   10.00    0.00    0.00    0.00    0.00    0.00    1.00    0.00    0.00   89.00
+15:42:02       0   20.00    0.00    0.00    0.00    0.00    0.00    1.00    0.00    0.00   79.00
+15:42:02       1    0.00    0.00    0.00    0.00    0.00    0.00    1.00    0.00    0.00   99.00
+
+15:42:02     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+15:42:03     all   30.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00   70.00
+15:42:03       0   60.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00   40.00
+15:42:03       1    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00  100.00
+
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+Average:     all   20.00    0.00    0.00    0.00    0.00    0.00    0.50    0.00    0.00   79.50
+Average:       0   40.00    0.00    0.00    0.00    0.00    0.00    0.50    0.00    0.00   59.50
+Average:       1    0.00    0.00    0.00    0.00    0.00    0.00    0.50    0.00    0.00   99.50
+"""
+
+
+def test_mpstat_sysstat_keeps_all_rows_and_average_block(tmp_path):
+    (tmp_path / "mpstat.out").write_text(MPSTAT_SYSSTAT_OUTPUT)
+    bin_dir, _, _ = _sampling_env(tmp_path, {"mpstat": SYSSTAT_V + (
+        f'echo "args: $* LC_ALL=$LC_ALL S_TIME_FORMAT=$S_TIME_FORMAT" >&2; cat {tmp_path}/mpstat.out'
+    )})
+    result = _run(mcp_ssh.mpstat_cmd(2, 1), bin_dir)
+    assert result.returncode == 0
+    assert "args: -P ALL 1 2 LC_ALL=C S_TIME_FORMAT=ISO" in result.stderr
+    lines = MPSTAT_SYSSTAT_OUTPUT.splitlines()
+    assert result.stdout.splitlines() == [
+        lines[0], "", lines[2], lines[3], lines[8], "", *lines[12:16],
+    ]
+
+
+def test_mpstat_sysstat_failure_is_not_hidden(tmp_path):
+    bin_dir, _, _ = _sampling_env(tmp_path, {"mpstat": SYSSTAT_V + "echo 'mpstat: boom' >&2; exit 2"})
+    result = _run(mcp_ssh.mpstat_cmd(2, 1), bin_dir)
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def _stat(cpu0, cpu1):
+    total = [a + b for a, b in zip(cpu0, cpu1)]
+    return "".join(
+        f"{name} {' '.join(map(str, values))}\n"
+        for name, values in (("cpu ", total), ("cpu0", cpu0), ("cpu1", cpu1))
+    ) + "intr 1 2 3\nctxt 5\n"
+
+
+MPSTAT_SNAPSHOTS = [
+    {"uptime": "100.00 50.00\n", "stat": _stat([100, 0, 50, 800, 0, 0, 0, 0, 0, 0],
+                                               [100, 0, 50, 800, 0, 0, 0, 0, 0, 0])},
+    # cpu0: user +90 (10 of it guest), system +10; cpu1: idle +100
+    {"uptime": "101.00 51.00\n", "stat": _stat([190, 0, 60, 800, 0, 0, 0, 0, 10, 0],
+                                               [100, 0, 50, 900, 0, 0, 0, 0, 0, 0])},
+    # cpu0: idle +100; cpu1: user +100
+    {"uptime": "102.00 52.00\n", "stat": _stat([190, 0, 60, 900, 0, 0, 0, 0, 10, 0],
+                                               [200, 0, 50, 900, 0, 0, 0, 0, 0, 0])},
+]
+MPSTAT_ROW = "%-8s %5s" + " %7.2f" * 10
+
+
+def _mpstat_row(label, cpu, usr=0, sys=0, guest=0, idle=0):
+    return MPSTAT_ROW % (label, cpu, usr, 0, sys, 0, 0, 0, 0, guest, 0, idle)
+
+
+def test_mpstat_without_sysstat_computes_from_proc(tmp_path):
+    bin_dir, proc_dir, _ = _sampling_env(tmp_path, snapshots=MPSTAT_SNAPSHOTS)
+    result = _run(mcp_ssh.mpstat_cmd(2, 1, proc_dir), bin_dir)
+    assert result.returncode == 0, result.stderr
+    header = "%-8s %5s    %%usr   %%nice    %%sys %%iowait    %%irq   %%soft  %%steal  %%guest  %%gnice   %%idle"
+    assert result.stdout.splitlines() == [
+        "# sysstat is not installed: computed from /proc/stat, 2 sample(s) 1s apart",
+        header % ("Sample", "CPU"),
+        _mpstat_row("1", "all", usr=40, sys=5, guest=5, idle=50),
+        _mpstat_row("2", "all", usr=50, idle=50),
+        "",
+        header % ("Average:", "CPU"),
+        _mpstat_row("Average:", "all", usr=45, sys=2.5, guest=2.5, idle=50),
+        _mpstat_row("Average:", "0", usr=40, sys=5, guest=5, idle=50),
+        _mpstat_row("Average:", "1", usr=50, idle=50),
+    ]
+
+
+def test_mpstat_without_sysstat_missing_proc_fails(tmp_path):
+    bin_dir, _, _ = _sampling_env(tmp_path)
+    result = _run(mcp_ssh.mpstat_cmd(1, 1, str(tmp_path / "missing")), bin_dir)
+    assert result.returncode != 0
+
+
+# ============================================================
 # get_journalctl_disk_usage — journalctl --disk-usage, as root when allowed
 # ============================================================
 
