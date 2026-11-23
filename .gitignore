@@ -13,3 +13,4 @@ json.log.json
 safe-ssh-mcp.log
 .mcpregistry_*_token
 
+scripts/ab_test/hosts.txt

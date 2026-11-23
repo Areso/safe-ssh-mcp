@@ -3,7 +3,7 @@ A secure and scoped SSH MCP server for executing read-only diagnostic commands o
 In this project, "safe" refers specifically to host safety: the server is designed to prevent modifications to the remote system and reduce the risk of operational harm. It does NOT attempt to guarantee that command output cannot be misused by external agents.
 
 ## Badges
-[![Snyk Vulnerability Database report](https://snyk.io/advisor/images/snyk-poweredby.svg)](https://security.snyk.io/package/pip/safe-ssh-mcp) - security check  
+[Snyk Vulnerability Database report](https://security.snyk.io/package/pip/safe-ssh-mcp) - security check  
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/safe-ssh-mcp?period=total&units=ABBREVIATION&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/safe-ssh-mcp)  
 
 ## Overview
@@ -12,6 +12,9 @@ The core philosophy behind this MCP server is safety first. Instead of providing
 
 ## Available Tools (Partial List)
 A few examples from each group; `<...>` marks a validated parameter.
+
+**Start here**
+- get_host_overview : a first look in one call: identity, uptime, CPU, memory, pressure, disks, mount problems, failed units, top processes, listening sockets, journal errors. Each section is exactly the output of an existing tool; facts only, no thresholds or findings
 
 **Disk and filesystems**
 - get_disk_free : `df -h`

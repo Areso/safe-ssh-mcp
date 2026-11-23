@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import socket
 import configparser
 import json
@@ -356,9 +357,41 @@ def get_ssh_client(
 # Alpine and other BusyBox systems ship no bash, so tool commands must also work in sh.
 SHELL_LAUNCHER = 'exec "$(command -v bash || echo sh)" -c "$0"'
 
-# How a command killed by the remote `timeout` reports back: GNU timeout exits with 124;
-# BusyBox timeout (Alpine) lets the command die from the signal, which paramiko reports as -1.
+# How a command stopped at the timeout reports back: 124, from GNU timeout or from the
+# watchdog in TIMEOUT_SCRIPT. -1 when the remote command left no exit status: GNU timeout
+# that had to send KILL (it kills its own process group, itself included), or _run_cmd
+# when the output never ended (see there).
 TIMEOUT_EXIT_CODES = (124, -1)
+
+# Runs the command ($0) with a time limit of $1 seconds, then stops it AND everything it
+# started. GNU timeout does that (it signals the whole process group), so it is used when
+# the host has it, with -k 2: without it a command that ignores TERM is never stopped,
+# with it GNU timeout sends KILL 2 s later. BusyBox timeout (Alpine)
+# signals only the one process it started: the rest of a pipeline (`du | sort`) or
+# anything started with `&` lives on, keeps the SSH channel open, and keeps running on
+# the host after the tool has returned. Elsewhere the
+# command therefore runs in its own session (setsid), and a watchdog stops that session's
+# whole process group: TERM at the limit, KILL 2 s later, exit code 124 like GNU timeout.
+# The watchdog tells the waiting shell with USR1, so a timeout is not mistaken for a command
+# that was killed for another reason. Its own output goes to /dev/null, so it cannot hold
+# the channel open, and it is stopped when the command ends first. Without setsid only the
+# command's shell can be signalled, as with BusyBox timeout; _run_cmd's read deadline then
+# still ends the call. ash's `kill` takes no `--`, hence `kill -TERM -PGID`; `wait` sends
+# ash's "Terminated" notice to /dev/null, as it is about the wrapper, not the command.
+TIMEOUT_SCRIPT = f"""L={shlex.quote(SHELL_LAUNCHER)}
+case "$(timeout --version 2>/dev/null)" in
+*'GNU coreutils'*) exec timeout -k 2 "$1"s sh -c "$L" "$0" ;;
+esac
+g=
+command -v setsid >/dev/null 2>&1 && g=-
+fired=
+trap fired=1 USR1
+${{g:+setsid}} sh -c "$L" "$0" & pid=$!
+${{g:+setsid}} sh -c 'sleep "$1"; kill -USR1 "$2"; kill -TERM "$3"; sleep 2; kill -KILL "$3"' watchdog "$1" $$ "$g$pid" </dev/null >/dev/null 2>&1 & dog=$!
+wait "$pid" 2>/dev/null; rc=$?
+if [ -n "$fired" ]; then wait "$pid" 2>/dev/null; exit 124; fi
+kill -TERM "$g$dog" 2>/dev/null
+exit "$rc\""""
 
 def is_probable_timeout(exit_code: int, elapsed_s: float, timeout_s: int) -> bool:
     """Checks whether the command was most likely killed by the remote `timeout` wrapper:
@@ -366,30 +399,60 @@ def is_probable_timeout(exit_code: int, elapsed_s: float, timeout_s: int) -> boo
     return exit_code in TIMEOUT_EXIT_CODES and elapsed_s >= timeout_s
 
 def timeout_wrapped(cmd: str, timeout_s: int) -> str:
-    """Wraps cmd the way every command is run on the remote host: under `timeout`, in bash
-    when the host has it and in sh otherwise (SHELL_LAUNCHER). Anything that runs a tool's
-    command must use this, or a command that relies on bash (set -o pipefail, read) breaks."""
-    return f"timeout {timeout_s}s sh -c {shlex.quote(SHELL_LAUNCHER)} {shlex.quote(cmd)}"
+    """Wraps cmd the way every command is run on the remote host: with a time limit that
+    stops the command and everything it started (TIMEOUT_SCRIPT), in bash when the host has
+    it and in sh otherwise (SHELL_LAUNCHER). Anything that runs a tool's command must use
+    this, or a command that relies on bash (set -o pipefail, read) breaks."""
+    return f"sh -c {shlex.quote(TIMEOUT_SCRIPT)} {shlex.quote(cmd)} {int(timeout_s)}"
+
+def _recv_all(recv, ready=None) -> tuple:
+    """Collects a channel stream until it ends. Returns (bytes, ended): ended is False when
+    a read hit the channel timeout, and the bytes are then what arrived until then. With
+    `ready`, only reads what has already arrived and never waits."""
+    chunks = []
+    try:
+        while ready is None or ready():
+            chunk = recv(32768)
+            if not chunk:
+                return b"".join(chunks), True
+            chunks.append(chunk)
+    except socket.timeout:
+        return b"".join(chunks), False
+    return b"".join(chunks), False
 
 def _run_cmd(client: paramiko.SSHClient, cmd: str, timeout_s: int = 20) -> Dict[str, Any]:
-    channel_timeout_s = 5 
+    channel_timeout_s = 5
     timeout_cmd = timeout_wrapped(cmd, timeout_s)
     started = time.monotonic()
     stdin, stdout, stderr = client.exec_command(timeout_cmd, timeout=timeout_s+channel_timeout_s)
+    channel = stdout.channel
     # Read the output BEFORE waiting for the exit status: once the unread output fills the
     # SSH window (about 2 MB) the remote command blocks, and waiting for its exit status
     # first would hang until the timeout and return cut-off output.
     # stderr is read only after stdout has ended: see decision_records/run_cmd_output_reading.md
-    out = stdout.read().decode(errors="replace").strip()
-    err = stderr.read().decode(errors="replace").strip()
+    # Bytes are collected and decoded once, so a chunk boundary cannot split a character.
+    out, ended = _recv_all(channel.recv)
+    if ended:
+        err, _ = _recv_all(channel.recv_stderr)
+        exit_code = channel.recv_exit_status()
+    else:
+        # The output did not end within timeout_s + channel_timeout_s: something on the host
+        # still holds it open after the time limit. Keep what arrived, take only the stderr
+        # that is already here (waiting for more would hang again), and give up on the exit
+        # status, which would wait forever.
+        err, _ = _recv_all(channel.recv_stderr, ready=channel.recv_stderr_ready)
+        exit_code = -1
+        channel.close()
     result = {
         "command": cmd,
-        "exit_code": stdout.channel.recv_exit_status(),
-        "stdout": out,
-        "stderr": err,
+        "exit_code": exit_code,
+        "stdout": out.decode(errors="replace").strip(),
+        "stderr": err.decode(errors="replace").strip(),
     }
-    if is_probable_timeout(result["exit_code"], time.monotonic() - started, timeout_s):
+    if not ended or is_probable_timeout(exit_code, time.monotonic() - started, timeout_s):
         result["timed_out"] = True
+    if not ended:
+        result["output_never_ended"] = True
     return result
 
 # ---- MCP Tool Boilerplate Helper ----
@@ -428,7 +491,14 @@ def run_ssh_command(
             "collected_at_utc": collected_at,
             "data": result,
         }
-        if result.get("timed_out"):
+        if result.get("output_never_ended"):
+            payload["error"] = (
+                f"The command timed out: its output was still open {timeout_s}s + 5s after it "
+                "started, so the server stopped reading. The output shown is what arrived until "
+                "then, and some of the command's processes may still be running on the host. "
+                "Retry with a larger timeout or a narrower request."
+            )
+        elif result.get("timed_out"):
             payload["error"] = (
                 f"The command probably timed out: it was stopped after the {timeout_s}s timeout "
                 f"(exit code {result['exit_code']}). Any output is incomplete. "
@@ -1488,6 +1558,14 @@ LIBC_PACKAGE_MUSL_CMD = (
     """&& [ -n "$pkg" ]; then printf '%s\\n' "$pkg" | sed 's/^musl-/package: musl /'; fi"""
 )
 
+# musl's ldd prints its version to stderr and exits 1, hence 2>&1 and head
+LIBC_VERSION_CMD = (
+    "if ls /lib/ld-musl-* >/dev/null 2>&1; then ls /lib/ld-musl-*; ldd --version 2>&1 | head -n 2; "
+    f"{LIBC_PACKAGE_MUSL_CMD}; "
+    "else ldd --version 2>&1 | head -n 1; "
+    f"{LIBC_PACKAGE_GLIBC_CMD}; fi"
+)
+
 @mcp.tool()
 def get_libc_version(
     host: str,
@@ -1505,14 +1583,7 @@ def get_libc_version(
     (e.g. 2.39-0ubuntu8.9, 2.34-289.el9, 1.2.6-r3) that security data is keyed by;
     it is taken from dpkg, rpm or apk and is absent on other distros.
     """
-    # musl's ldd prints its version to stderr and exits 1, hence 2>&1 and head
-    cmd = (
-        "if ls /lib/ld-musl-* >/dev/null 2>&1; then ls /lib/ld-musl-*; ldd --version 2>&1 | head -n 2; "
-        f"{LIBC_PACKAGE_MUSL_CMD}; "
-        "else ldd --version 2>&1 | head -n 1; "
-        f"{LIBC_PACKAGE_GLIBC_CMD}; fi"
-    )
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return run_ssh_command(host, user, LIBC_VERSION_CMD, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
 def get_sshd_effective_config(
@@ -1741,23 +1812,6 @@ def get_free_memory(
     Returns free memory, swap (total/free), page cache, HugePages and so on
     """
     cmd = FREE_MEMORY_CMD
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
-
-@mcp.tool()
-def get_memory_pressure(
-    host: str,
-    user: str,
-    port: int = 22,
-    password: Optional[str] = None,
-    key_path: Optional[str] = None,
-    timeout: int = 20,
-    accept_new_hostkey: bool = False,
-) -> Dict[str, Any]:
-    """
-    DEPRECATED: use get_pressure, which returns CPU, I/O and memory pressure in one call.
-    Returns memory pressure if supported
-    """
-    cmd = "cat /proc/pressure/memory 2>/dev/null || echo 'PSI not supported'"
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
@@ -3429,6 +3483,106 @@ def get_coredumps(
         # coredumpctl lists oldest first, so the tail keeps the most recent ones
         cmd = tail_keeping_header(cmd, lines)
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+# ---- Host overview ----
+# Many facts in one tool call: every section is exactly what one existing tool sends (the
+# same builder), run one after another over the pooled SSH connection, each in its own
+# channel through run_ssh_command, as that tool would. Facts only: no thresholds, no
+# findings, no ranking; interpreting them is the caller's job.
+# See decision_records/get_host_overview.md.
+HOST_OVERVIEW_SECTIONS = (
+    # (section, the tool it comes from, the command that tool sends)
+    ("hostname", "get_hostname", HOSTNAME_CMD),
+    ("os_release", "get_distroname_version", OS_RELEASE_CMD),
+    ("kernel", "get_kernel_version", KERNEL_VERSION_CMD),
+    ("libc", "get_libc_version", LIBC_VERSION_CMD),
+    ("uptime", "get_uptime", UPTIME_CMD),
+    ("cpu", "get_cpu_info", cpu_info_cmd(False)),
+    ("memory", "get_free_memory", FREE_MEMORY_CMD),
+    ("pressure", "get_pressure", PRESSURE_CMD),
+    ("disk_free", "get_disk_free", DISK_FREE_CMD),
+    ("inode_usage", "get_inode_usage", INODE_USAGE_CMD),
+    ("mount_problems", "get_mount_problems", mount_problems_cmd()),
+    ("failed_units", "get_systemd_list_failed", SYSTEMD_FAILED_CMD),
+    ("top_cpu_processes", "get_ps_aux_top_cpu_consumers", PS_TOP_CPU_CMD),
+    ("top_memory_processes", "get_ps_aux_top_mem_consumers", PS_TOP_MEM_CMD),
+    ("listening_sockets", "get_listening_sockets", LISTENING_SOCKETS_CMD),
+    ("journal_errors", "get_journal_errors", journal_errors_cmd(200)),
+)
+HOST_OVERVIEW_TIMEOUT_MAX_S = 120
+
+def tool_default_timeout(tool: str) -> int:
+    """The default `timeout` of a tool, so that a section is run as that tool would run it."""
+    return inspect.signature(globals()[tool]).parameters["timeout"].default
+HOST_OVERVIEW_TIMEOUT_ERROR = f"Invalid timeout: an integer from 1 to {HOST_OVERVIEW_TIMEOUT_MAX_S} (seconds per section)"
+
+@mcp.tool()
+def get_host_overview(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: Optional[int] = None,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Collects a broad first look at a remote Linux host in one tool call: a good first call
+    on an unfamiliar host, before the narrower tools. Facts only: no thresholds, no
+    findings, no judgement of what is normal; interpreting them is left to the caller.
+    Each section is exactly the result of the tool named in its source_tool, with that
+    tool's defaults (its timeout included), so that tool's description applies to it:
+    hostname (get_hostname), os_release (get_distroname_version), kernel (get_kernel_version),
+    libc (get_libc_version), uptime (get_uptime), cpu (get_cpu_info), memory (get_free_memory),
+    pressure (get_pressure), disk_free (get_disk_free), inode_usage (get_inode_usage),
+    mount_problems (get_mount_problems), failed_units (get_systemd_list_failed),
+    top_cpu_processes (get_ps_aux_top_cpu_consumers), top_memory_processes
+    (get_ps_aux_top_mem_consumers), listening_sockets (get_listening_sockets),
+    journal_errors (get_journal_errors, last 200 warnings and errors).
+    Parts that need root (findmnt --verify in mount_problems, process names in
+    listening_sockets) use sudo -n / doas -n and fall back as those tools do.
+    data.sections maps each section, in this order, to {source_tool, ok, exit_code, stdout,
+    stderr, seconds} plus timed_out and error when that tool's result has them. seconds is
+    the time of the section's SSH call as seen from this server.
+    A section that does not apply to the host fails on its own (e.g. failed_units and
+    journal_errors without systemd: exit code 127) and the others still run; ok is True
+    when the host was reachable for every section, whatever the sections returned.
+    timeout (seconds, 1-120), when given, is the limit for EACH section instead of its
+    tool's default (10-20 s). The sections run one after another over one SSH
+    connection: usually a few seconds in all.
+    The output is not shortened: about 10-20 KB on a typical server.
+    """
+    if timeout is not None and (not isinstance(timeout, int) or isinstance(timeout, bool)
+                                or not 1 <= timeout <= HOST_OVERVIEW_TIMEOUT_MAX_S):
+        return {"ok": False, "error": HOST_OVERVIEW_TIMEOUT_ERROR}
+    collected_at = datetime.now(timezone.utc).isoformat()
+    sections: Dict[str, Any] = {}
+    for name, tool, cmd in HOST_OVERVIEW_SECTIONS:
+        started = time.monotonic()
+        section_timeout = tool_default_timeout(tool) if timeout is None else timeout
+        result = run_ssh_command(host, user, cmd, port, password, key_path, section_timeout, accept_new_hostkey)
+        data = result.get("data")
+        if not isinstance(data, dict):
+            # could not connect or authenticate: every other section would fail the same way
+            if not sections:
+                return result
+            return {"ok": False, "host": host, "collected_at_utc": collected_at,
+                    "error": f"Section {name} could not be collected, so the overview stopped there: {result.get('error')}",
+                    "data": {"sections": sections}}
+        section = {
+            "source_tool": tool,
+            "ok": result["ok"],
+            "exit_code": data["exit_code"],
+            "stdout": data["stdout"],
+            "stderr": data["stderr"],
+            "seconds": round(time.monotonic() - started, 2),
+        }
+        if data.get("timed_out"):
+            section["timed_out"] = True
+        if result.get("error"):
+            section["error"] = result["error"]
+        sections[name] = section
+    return {"ok": True, "host": host, "collected_at_utc": collected_at, "data": {"sections": sections}}
 ## == END OF TOOLS == ##
 
 

@@ -8,8 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
-## Unreleased
+## 0.3.0 - 2026-11-23
 ### Added
+- `get_host_overview`: a broad first look at a host in one tool call, in 16 sections:
+  hostname, OS release, kernel, libc, uptime, CPU, memory, pressure, disk space, inodes,
+  mount problems, failed units, top CPU and memory processes, listening sockets and
+  journal errors. Each section is exactly the result of an existing tool (named in
+  `source_tool`) with that tool's defaults, run over the pooled SSH connection. Facts
+  only: no thresholds, no findings. A section that does not apply (no systemd on Alpine)
+  fails on its own and the others still run. `timeout`, when given, replaces every
+  section's default limit. Output is not shortened (10-25 KB of JSON on the test VMs).
+  See [decision_records/get_host_overview.md](decision_records/get_host_overview.md).
+- `LIBC_VERSION_CMD`: the command of `get_libc_version` as a shared constant (unchanged).
 - `get_cron_jobs`: every cron job of the host: `/etc/crontab`, `/etc/anacrontab`,
   `/etc/cron.d/*`, the crontab of every user (Debian `/var/spool/cron/crontabs`, RHEL
   `/var/spool/cron`, Alpine `/etc/crontabs`; a directory reached through a symlink is
@@ -30,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_cron_jobs`. See [decision_records/redact_secrets.md](decision_records/redact_secrets.md).
 
 ### Fixed
+- Timeouts on BusyBox hosts (Alpine): BusyBox `timeout` stops only the process it
+  started, so the rest of a pipeline (`du | sort`) or a background job lived on. It kept
+  the SSH output open: the call hung until `timeout_s` + 5 s, returned
+  `Network error: Could not connect` with the output lost, and the processes kept running
+  on the host. Commands now run in their own session (`setsid`) with a watchdog that stops
+  the whole process group (TERM, then KILL 2 s later) and exits 124 like GNU timeout.
+  Hosts with GNU timeout keep using it, now with `-k 2`, so a command that ignores TERM
+  is killed too instead of running on. Checked on Debian 13, Ubuntu 24.04, Fedora 44,
+  CentOS Stream 10 and Alpine 3.24. See
+  [decision_records/remote_timeout.md](decision_records/remote_timeout.md).
+- Output that is still open after `timeout_s` + 5 s is no longer reported as a network
+  error: the result has `timed_out: true`, `output_never_ended: true`, the output that
+  arrived until then, and an error saying that processes may still run on the host.
 - `get_crontab_tasks` returned `ok: false` for a user without a crontab (`crontab -l`
   exits 1). It now returns `# no crontab for the login user (<user>)` with exit code 0;
   an empty crontab says so too. Other failures (permission denied, not allowed to use
@@ -71,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `# not run as root` first line, if that is refused. Says `journalctl is not installed
   on this host` on hosts without systemd. See
   [decision_records/as_root.md](decision_records/as_root.md).
+
+### Removed
+- `get_memory_pressure`, deprecated since 0.2.0: use `get_pressure`, which returns
+  memory pressure together with CPU and I/O pressure.
 
 ## 0.2.3 - 2026-11-17
 ### Added

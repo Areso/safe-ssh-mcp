@@ -6,6 +6,7 @@ import paramiko
 import pytest
 
 import mcp_ssh
+from tests.conftest import stream_chunks
 
 
 class TestRunSshCommandSuccess:
@@ -33,9 +34,8 @@ class TestRunSshCommandSuccess:
     def test_command_runs_in_bash_with_sh_fallback(self, mock_ssh_client):
         mcp_ssh.run_ssh_command("h", "u", "echo 'it works'", timeout_s=7)
         remote_cmd = mock_ssh_client.exec_command.call_args[0][0]
-        assert remote_cmd == (
-            """timeout 7s sh -c 'exec "$(command -v bash || echo sh)" -c "$0"' 'echo '"'"'it works'"'"''"""
-        )
+        assert remote_cmd == mcp_ssh.timeout_wrapped("echo 'it works'", 7)
+        assert remote_cmd.endswith(""" 'echo '"'"'it works'"'"'' 7""")
 
     @pytest.mark.parametrize("exit_code", [124, -1])
     def test_timeout_is_reported(self, mock_ssh_client, mocker, exit_code):
@@ -49,6 +49,7 @@ class TestRunSshCommandSuccess:
     @pytest.mark.parametrize("exit_code, elapsed", [
         (124, 0.3),   # a command that itself exits 124 quickly
         (-1, 0.3),    # killed by a signal for another reason
+        (137, 9.0),   # killed with KILL for another reason (e.g. out of memory)
         (1, 9.0),     # slow, but an ordinary failure
         (0, 9.0),
     ])
@@ -70,6 +71,61 @@ class TestRunSshCommandSuccess:
         assert "stdout" in result["data"]
         assert "stderr" in result["data"]
         assert "command" in result["data"]
+
+
+class TestRunCmdReading:
+
+    def test_output_in_chunks_is_joined_before_decoding(self, mock_ssh_client):
+        channel = mock_ssh_client.exec_command.return_value[1].channel
+        euro = "€".encode()
+        channel.recv.side_effect = stream_chunks(b"price: " + euro[:1], euro[1:] + b" 5")
+        channel.recv_stderr.side_effect = stream_chunks(b"warn", b"ing")
+        result = mcp_ssh.run_ssh_command("h", "u", "cmd")
+        assert (result["data"]["stdout"], result["data"]["stderr"]) == ("price: € 5", "warning")
+
+    def test_stdout_is_read_to_the_end_before_stderr_and_exit_status(self, mock_ssh_client):
+        channel = mock_ssh_client.exec_command.return_value[1].channel
+        order = []
+        channel.recv.side_effect = lambda n: order.append("stdout") or b""
+        channel.recv_stderr.side_effect = lambda n: order.append("stderr") or b""
+        channel.recv_exit_status.side_effect = lambda: order.append("exit") or 0
+        mcp_ssh.run_ssh_command("h", "u", "cmd")
+        assert order == ["stdout", "stderr", "exit"]
+
+    def _never_ending(self, mock_ssh_client, stderr_ready):
+        channel = mock_ssh_client.exec_command.return_value[1].channel
+        channel.recv.side_effect = stream_chunks(b"start\n", b"more", socket.timeout())
+        channel.recv_stderr.side_effect = stream_chunks(*stderr_ready)
+        channel.recv_stderr_ready.side_effect = [True] * len(stderr_ready) + [False]
+        return channel
+
+    def test_output_that_never_ends_is_a_timeout_with_the_output_so_far(self, mock_ssh_client):
+        channel = self._never_ending(mock_ssh_client, [b"err so far"])
+        result = mcp_ssh.run_ssh_command("h", "u", "du / | sort", timeout_s=7)
+        assert result["ok"] is False
+        assert result["data"] == {
+            "command": "du / | sort", "exit_code": -1, "stdout": "start\nmore", "stderr": "err so far",
+            "timed_out": True, "output_never_ended": True,
+        }
+        assert result["error"].startswith("The command timed out: its output was still open 7s + 5s")
+        assert "may still be running on the host" in result["error"]
+        # waiting for the exit status would hang for ever; the channel is closed instead
+        channel.recv_exit_status.assert_not_called()
+        channel.close.assert_called_once()
+
+    def test_output_that_never_ends_takes_only_the_stderr_already_there(self, mock_ssh_client):
+        channel = self._never_ending(mock_ssh_client, [])
+        result = mcp_ssh.run_ssh_command("h", "u", "cmd")
+        assert result["data"]["stderr"] == ""
+        channel.recv_stderr.assert_not_called()
+
+    def test_output_that_never_ends_is_not_a_network_error(self, mock_ssh_client):
+        self._never_ending(mock_ssh_client, [])
+        assert "Network error" not in mcp_ssh.run_ssh_command("h", "u", "cmd")["error"]
+
+    def test_a_timeout_while_connecting_is_still_a_network_error(self, mocker):
+        mocker.patch("mcp_ssh.get_ssh_client", side_effect=socket.timeout("timed out"))
+        assert mcp_ssh.run_ssh_command("h", "u", "cmd")["error"].startswith("Network error")
 
 
 class TestRunSshCommandKeyPath:

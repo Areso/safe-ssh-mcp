@@ -39,7 +39,6 @@ import mcp_ssh
         "| sort -n -r | awk 'NR <= 9' | cut -f 2-; }; fi",
     ),
     (mcp_ssh.get_free_memory, "free -h && echo && cat /proc/meminfo"),
-    (mcp_ssh.get_memory_pressure, "cat /proc/pressure/memory 2>/dev/null || echo 'PSI not supported'"),
     (
         mcp_ssh.get_pressure,
         'for r in cpu io memory; do echo "== $r =="; '

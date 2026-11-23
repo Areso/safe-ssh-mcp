@@ -8,6 +8,13 @@ Status: accepted, open to revision
 `_run_cmd` reads the whole stdout, then the whole stderr, then asks for the exit
 status. The two streams are not read at the same time. This is left as it is.
 
+Update 2026-11-23: the streams are now read with `channel.recv` / `channel.recv_stderr`
+in chunks instead of `stdout.read()` / `stderr.read()`, so output that arrived before a
+read timeout is kept (see [remote_timeout.md](remote_timeout.md)). The order, and so the
+known gap below, is unchanged. The mocked SSH client fakes `channel.recv` and
+`recv_stderr` now (`stream_chunks` in `tests/conftest.py`), so the notes on the mock
+below refer to the old fixture.
+
 ## Background
 
 Until 0.2.0 the exit status was requested before any output was read. SSH buffers only

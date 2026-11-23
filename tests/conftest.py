@@ -74,16 +74,32 @@ def mock_run_ssh_command(mocker):
 # ---------------------------------------------------------------------------
 # Patches mcp_ssh.get_ssh_client — used by test_run_ssh_command.py
 # ---------------------------------------------------------------------------
+def stream_chunks(*chunks):
+    """A side_effect for channel.recv / recv_stderr: the chunks, then b"" for ever.
+    An exception instance among the chunks is raised instead (e.g. socket.timeout())."""
+    items = iter(chunks)
+
+    def recv(_nbytes):
+        item = next(items, b"")
+        if isinstance(item, BaseException):
+            raise item
+        return item
+    return recv
+
+
 @pytest.fixture
 def mock_ssh_client(mocker):
     """Return a mock SSHClient and patch get_ssh_client to return it."""
     mock_client = mocker.MagicMock(spec=paramiko.SSHClient)
 
     mock_stdout = mocker.MagicMock()
-    mock_stdout.channel.recv_exit_status.return_value = 0
-    mock_stdout.read.return_value = b"output"
+    channel = mock_stdout.channel
+    channel.recv_exit_status.return_value = 0
+    # Each stream gives its bytes once, then b"" (the end of the stream)
+    channel.recv.side_effect = stream_chunks(b"output")
+    channel.recv_stderr.side_effect = stream_chunks(b"")
     mock_stderr = mocker.MagicMock()
-    mock_stderr.read.return_value = b""
+    mock_stderr.channel = channel
     mock_client.exec_command.return_value = (mocker.MagicMock(), mock_stdout, mock_stderr)
 
     mocker.patch("mcp_ssh.get_ssh_client", return_value=mock_client)

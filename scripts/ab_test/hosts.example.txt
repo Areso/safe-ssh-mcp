@@ -1,0 +1,8 @@
+# Copy to hosts.txt (git-ignored) and list disposable test VMs, one per line:
+#   name  user@host[:port]
+# The hosts must already be in ~/.ssh/known_hosts. With DigitalOcean: `doctl list`.
+debian  root@203.0.113.10
+ubuntu  root@203.0.113.11
+fedora  root@203.0.113.12
+centos  root@203.0.113.13
+alpine  alpine@203.0.113.14
