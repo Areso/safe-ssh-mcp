@@ -2513,3 +2513,77 @@ def test_apk_database_to_tsv(database):
         "musl\t1.2.5-r0\tx86_64\tmusl\n"
         "busybox-binsh\t1.36.1-r29\tx86_64\tbusybox\n"
     )
+
+
+# ============================================================
+# get_systemd_unit_definition
+# ============================================================
+
+def test_systemd_unit_definition_command(mock_run_ssh_command):
+    mcp_ssh.get_systemd_unit_definition(daemon="paas_backend", host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == "systemctl cat --no-pager -- paas_backend"
+
+
+def test_systemd_unit_definition_builder_quotes_after_double_dash():
+    assert mcp_ssh.systemd_unit_definition_cmd("user@1000.service") == "systemctl cat --no-pager -- user@1000.service"
+    assert mcp_ssh.systemd_unit_definition_cmd("a--host-x") == "systemctl cat --no-pager -- a--host-x"
+
+
+def test_systemd_unit_definition_forwards_ssh_args(mock_run_ssh_command):
+    mcp_ssh.get_systemd_unit_definition(daemon="nginx", host="h", user="u", port=2222, password="pw",
+                                        key_path="/k", timeout=7, accept_new_hostkey=True)
+    assert mock_run_ssh_command.call_args[0] == (
+        "h", "u", "systemctl cat --no-pager -- nginx", 2222, "pw", "/k", 7, True)
+
+
+@pytest.mark.parametrize("daemon", ["nginx; cat /etc/shadow", "-Hroot@otherhost", "", None, "a" * 256, "x\n"])
+def test_systemd_unit_definition_rejects_bad_names(daemon, mock_run_ssh_command):
+    result = mcp_ssh.get_systemd_unit_definition(daemon=daemon, host="h", user="u")
+    assert result["ok"] is False
+    assert result["error"] == mcp_ssh.systemd_unit_name_error(daemon)
+    mock_run_ssh_command.assert_not_called()
+
+
+UNIT_FILE = """# /etc/systemd/system/paas_backend.service
+[Unit]
+Description=PaaS backend
+
+[Service]
+User=paas
+WorkingDirectory=/opt/paas
+EnvironmentFile=-/etc/default/paas
+Environment="DB_PASSWORD=hunter2 two" "MODE=prod"
+Environment=AMQP_URL=amqp://paas:s3cret@localhost:5672/ LOG_LEVEL=info
+ExecStart=/opt/paas/venv/bin/python backend.py --api-key abc123
+StandardError=append:/var/log/paas/backend.err
+Restart=always
+
+# /etc/systemd/system/paas_backend.service.d/override.conf
+[Service]
+Environment=API_TOKEN=xyz
+"""
+
+
+def test_systemd_unit_definition_redacts_secrets(mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": True, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": 0, "stdout": UNIT_FILE, "stderr": ""},
+    }
+    result = mcp_ssh.get_systemd_unit_definition(daemon="paas_backend", host="h", user="u")
+    out = result["data"]["stdout"]
+    for secret in ("hunter2", "two", "s3cret", "abc123", "xyz"):
+        assert secret not in out
+    R = mcp_ssh.REDACTED
+    assert f'Environment="DB_PASSWORD={R}" "MODE=prod"' in out
+    assert f"AMQP_URL=amqp://paas:{R}@localhost:5672/ LOG_LEVEL=info" in out
+    assert result["redaction"]["replaced"] == 4
+    # the settings the tool is for are kept as they are
+    for kept in ("# /etc/systemd/system/paas_backend.service.d/override.conf", "WorkingDirectory=/opt/paas",
+                 "EnvironmentFile=-/etc/default/paas", "StandardError=append:/var/log/paas/backend.err",
+                 "Restart=always", "User=paas"):
+        assert kept in out
+
+
+def test_systemd_unit_definition_keeps_error_results(mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {"ok": False, "error": "Network error"}
+    assert mcp_ssh.get_systemd_unit_definition(daemon="x", host="h", user="u") == {"ok": False, "error": "Network error"}

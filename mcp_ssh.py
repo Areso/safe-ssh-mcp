@@ -994,24 +994,34 @@ def tail_keeping_header(cmd: str, lines: int) -> str:
 # their docstring, and every result they return carries a "redaction" field.
 
 REDACTED = "<redacted>"
-# A value: quoted, or up to the next space or quote. Never one that is already redacted,
-# so that a value matched by two rules is replaced (and counted) once; never one that
-# starts with '-', so that `--token --verbose` keeps --verbose.
-_SECRET_VALUE = r"""(?!<redacted>)(?!-)(?:"[^"\n]*"|'[^'\n]*'|[^\s'"]+)"""
+# A value: quoted, or up to the next space, quote or ';' (a shell command separator, and
+# the field separator of connection strings: Password=x;Database=app). Never one that is
+# already redacted, so that a value matched by two rules is replaced (and counted) once;
+# never one that starts with '-', so that `--token --verbose` keeps --verbose.
+_SECRET_VALUE = r"""(?!<redacted>)(?!-)(?:"[^"\n]*"|'[^'\n]*'|[^\s'";]+)"""
 # no bare "pass": it would also catch bypass, passthrough, ...; db_pass is the common exception
 _SECRET_WORDS = r"(?:password|passwd|passphrase|db_pass|secret|token|api[-_]?key|access[-_]?key|private[-_]?key|credentials?)"
+# Names that end in _KEY / _PWD / _PAT (STRIPE_KEY, MYSQL_PWD, GITHUB_PAT) hold secrets too,
+# except these _KEY names, which are not secrets. PWD without a prefix is the working directory.
+_NOT_SECRET_KEYS = r"(?:public|primary|foreign|unique|sort|partition|routing|cache|lookup)_key"
+# Tokens recognised by their prefix wherever they appear; the prefix is kept, so the kind
+# of token stays visible: Stripe live keys, GitHub tokens, Slack bot tokens, AWS access key IDs
+_SECRET_SUFFIX_NAME = rf"(?![A-Za-z0-9_.]*?(?<![A-Za-z0-9]){_NOT_SECRET_KEYS}\b)[A-Za-z0-9_.]*_(?:key|pwd|pat)"
+_TOKEN_PREFIXES = r"(?:sk_live_|ghp_|xoxb-|AKIA)"
+_TOKEN_BODY = r"(?:(?<=sk_live_)[A-Za-z0-9]{10,}|(?<=ghp_)[A-Za-z0-9]{30,}|(?<=xoxb-)[A-Za-z0-9-]{10,}|(?<=AKIA)[A-Z0-9]{16})"
 # Each pattern has a group k (kept), a group v (replaced) and, optionally, a group s (kept).
 # The order matters: a narrow rule runs before the broad one that would match the same text.
 SECRET_PATTERNS = tuple(re.compile(pattern, flags) for pattern, flags in (
     # PEM private keys, whole block
     (r"(?P<k>-----BEGIN [A-Z ]*PRIVATE KEY-----)(?P<v>.*?)(?P<s>-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL),
-    # scheme://user:password@host
-    (r"(?P<k>\b[a-z][a-z0-9+.-]*://[^\s/:@'\"]+:)(?P<v>(?!<redacted>)[^\s@/'\"]+)(?=@)", re.IGNORECASE),
+    # scheme://user:password@host, and scheme://:password@host (Redis has no user)
+    (r"(?P<k>\b[a-z][a-z0-9+.-]*://[^\s/:@'\"]*:)(?P<v>(?!<redacted>)[^\s@/'\"]+)(?=@)", re.IGNORECASE),
     # Authorization: Bearer xyz / Basic xyz / xyz
     (r"(?P<k>\bAuthorization:\s*(?:(?:Bearer|Basic|Token|Digest)\s+)?)(?P<v>(?!<redacted>)[^\s'\"]+)", re.IGNORECASE),
     (r"(?P<k>\bBearer\s+)(?P<v>[A-Za-z0-9._~+/=-]{8,})", 0),
-    # --password=x, --password x, --api-key x, ...
-    (rf"(?P<k>--{_SECRET_WORDS}(?:=|\s+))(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
+    # --password=x, --password x, --api-key x, --db-password x, --client-secret x, ...
+    # (nothing may follow the word: --password-stdin and --password-file take no secret)
+    (rf"(?P<k>--[A-Za-z0-9_-]*{_SECRET_WORDS}(?:=|\s+))(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
     # mysql -pSECRET (the password is attached to -p; -p alone prompts, -P is the port)
     (r"(?P<k>\b(?:mysql|mysqldump|mysqladmin|mysqlcheck|mysqlimport|mariadb|mariadb-dump|mariadb-admin)\b"
      r"[^\n|;&]*?\s-p)(?P<v>(?!<redacted>)(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s'\"]+))", 0),
@@ -1019,25 +1029,47 @@ SECRET_PATTERNS = tuple(re.compile(pattern, flags) for pattern, flags in (
     (rf"(?P<k>\bsshpass\s+-p\s*)(?P<v>{_SECRET_VALUE})", 0),
     # curl -u user:password / --user user:password
     (r"(?P<k>\s(?:-u|--user)\s*[^\s:'\"]+:)(?P<v>(?!<redacted>)[^\s'\"]+)", 0),
+    # STRIPE_KEY=x, MYSQL_PWD=x, GITHUB_PAT=x, but not PRIMARY_KEY=x
+    (rf"(?P<k>\b{_SECRET_SUFFIX_NAME}[\"']?\s*[=:]\s*)(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
     # DB_PASSWORD=x, export API_TOKEN=x, password: x, "secret": "x"
     (rf"(?P<k>\b[A-Za-z0-9_.-]*{_SECRET_WORDS}[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
+    # sk_live_..., ghp_..., xoxb-..., AKIA... anywhere, by the token's own prefix. Last, so that
+    # a token already replaced as the value of an assignment is not counted twice.
+    (rf"(?P<k>\b{_TOKEN_PREFIXES})(?P<v>{_TOKEN_BODY})\b", 0),
 ))
+# Unit files quote a whole assignment: Environment="DB_PASSWORD=a b" MODE=prod. There the
+# value runs to the closing quote, spaces included. Only for systemd output: in a shell line
+# ("sh -c 'DB_PASS=x ./run'") the same rule would also hide the command after the value.
+SYSTEMD_SECRET_PATTERNS = (re.compile(
+    rf"(?P<k>(?P<q>[\"'])(?:[A-Za-z0-9_.-]*{_SECRET_WORDS}[A-Za-z0-9_.-]*|{_SECRET_SUFFIX_NAME})=)(?P<v>(?!<redacted>)[^\"'\n]+)(?=(?P=q))",
+    re.IGNORECASE),) + SECRET_PATTERNS
+# Mount options (fstab, mount.cifs) are comma-separated: a value ends at the next single
+# comma, so the options after it stay visible (mount.cifs writes a comma inside a password
+# as ",,"). cifs takes the password as password=, password2=, pass= or after a % in
+# user=name%password. credentials= is a file path, hidden all the same (the broad rule
+# would hide it, and the options after it). See decision_records/redact_mount_options.md.
+_MOUNT_OPTION_VALUE = r"(?!<redacted>)(?:[^\s,]|,,)+"
+MOUNT_SECRET_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    rf"(?P<k>(?<![^\s,])(?:password2?|passwd|pass|credentials?)=)(?P<v>{_MOUNT_OPTION_VALUE})",
+    rf"(?P<k>(?<![^\s,])user(?:name)?=[^\s,%]*%)(?P<v>{_MOUNT_OPTION_VALUE})",
+)) + SECRET_PATTERNS
 REDACTION_NOTE = (
     f"Values that look like secrets (passwords, tokens, keys, credentials in URLs) were replaced "
     f"with '{REDACTED}'. Redaction is pattern-based: a secret written in an unusual form may "
     f"still be shown, and a harmless value that looks like a secret may be hidden."
 )
 
-def redact_secrets(text: str) -> Tuple[str, int]:
+def redact_secrets(text: str, patterns: Tuple[re.Pattern, ...] = SECRET_PATTERNS) -> Tuple[str, int]:
     """Replaces values that look like secrets in free text by REDACTED. Returns the text and
     how many values were replaced. See SECRET_PATTERNS for what is caught."""
     count = 0
-    for pattern in SECRET_PATTERNS:
+    for pattern in patterns:
         text, n = pattern.subn(lambda m: m.group("k") + REDACTED + (m.groupdict().get("s") or ""), text)
         count += n
     return text, count
 
-def redact_secrets_in_result(result: Dict[str, Any]) -> Dict[str, Any]:
+def redact_secrets_in_result(result: Dict[str, Any],
+                             patterns: Tuple[re.Pattern, ...] = SECRET_PATTERNS) -> Dict[str, Any]:
     """Redacts the stdout and stderr of a run_ssh_command result in place and adds a
     "redaction" field with the number of values replaced and REDACTION_NOTE. A result
     without output (validation or connection error) is returned unchanged."""
@@ -1047,7 +1079,7 @@ def redact_secrets_in_result(result: Dict[str, Any]) -> Dict[str, Any]:
     replaced = 0
     for stream in ("stdout", "stderr"):
         if isinstance(data.get(stream), str):
-            data[stream], n = redact_secrets(data[stream])
+            data[stream], n = redact_secrets(data[stream], patterns)
             replaced += n
     result["redaction"] = {"replaced": replaced, "note": REDACTION_NOTE}
     return result
@@ -1724,6 +1756,11 @@ def get_systemd_status(
     Gets the detailed status, logs, and error messages for a SPECIFIC systemd daemon/service/unit.
     daemon is a unit name such as nginx, sshd.service or user@1000.service: ASCII letters,
     digits and . - _ @ : only, starting with a letter or digit, at most 255 characters.
+    Process command lines and log lines in the output can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     error = systemd_unit_name_error(daemon)
     if error:
@@ -1731,7 +1768,46 @@ def get_systemd_status(
         return {"ok": False, "error": error}
     # --: whatever follows is a unit name, never a systemctl option
     cmd = f"systemctl status -- {shlex.quote(daemon)}"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
+
+def systemd_unit_definition_cmd(daemon: str) -> str:
+    """Builds the get_systemd_unit_definition command; daemon must already be validated."""
+    # --: whatever follows is a unit name, never a systemctl option
+    return f"systemctl cat --no-pager -- {shlex.quote(daemon)}"
+
+@mcp.tool()
+def get_systemd_unit_definition(
+    daemon: str,
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = 20,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Gets the definition of a SPECIFIC systemd daemon/service/unit as systemd reads it
+    (systemctl cat): the unit file and every drop-in override, each after a '# /path' line.
+    USE THIS TOOL to see how a unit is run: ExecStart=, User=, WorkingDirectory=, Restart=,
+    StandardOutput= / StandardError= (where the program's output goes when it is not in the
+    journal), Environment= and EnvironmentFile= (only its path: the file's contents are not
+    read). A setting that is absent has its systemd default (StandardOutput=journal, Restart=no).
+    daemon is a unit name such as nginx, sshd.service or user@1000.service: ASCII letters,
+    digits and . - _ @ : only, starting with a letter or digit, at most 255 characters.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
+    """
+    error = systemd_unit_name_error(daemon)
+    if error:
+        logger.error(f"get_systemd_unit_definition tool: {error}")
+        return {"ok": False, "error": error}
+    cmd = systemd_unit_definition_cmd(daemon)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result, SYSTEMD_SECRET_PATTERNS)
 
 # BusyBox ps (Alpine) has neither `aux --sort` nor %cpu/%mem columns, so each tool tries
 # procps first and falls back to a BusyBox command when ps rejects the options.
@@ -1773,9 +1849,15 @@ def get_ps_aux_top_cpu_consumers(
     On BusyBox hosts (Alpine), where ps cannot sort, the output comes from `top -b -n 1`
     instead: its first line starts with '# BusyBox', the columns differ, and %CPU is the
     usage at this moment, not the average over the process lifetime that ps reports.
+    Process command lines can hold secrets (--password=..., URLs with credentials).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     cmd = PS_TOP_CPU_CMD
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 @mcp.tool()
 def get_ps_aux_top_mem_consumers(
@@ -1792,9 +1874,15 @@ def get_ps_aux_top_mem_consumers(
     On BusyBox hosts (Alpine), where ps cannot sort and has no %MEM, the output is
     `ps -o pid,user,rss,vsz,args` sorted by RSS instead: its first line starts with
     '# BusyBox' and sizes are in KB unless they carry an m or g suffix.
+    Process command lines can hold secrets (--password=..., URLs with credentials).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     cmd = PS_TOP_MEM_CMD
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 FREE_MEMORY_CMD = "free -h && echo && cat /proc/meminfo"
 
@@ -1850,9 +1938,15 @@ def get_fstab(
     or a device), mount points, types and options (noauto, nofail, ro, ...).
     What is mounted now is get_mounts; to find fstab entries that are not mounted, mounted
     read-only by mistake or would fail on the next boot, use get_mount_problems.
+    Mount options can hold secrets (cifs password=, user=name%password).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     cmd = "cat /etc/fstab"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result, MOUNT_SECRET_PATTERNS)
 
 MOUNT_PROBLEMS_VERIFY_PLAIN_NOTE = (
     "# not run as root (no sudo -n / doas -n access): on-disk filesystem types were not "
@@ -1985,9 +2079,15 @@ def get_mount_problems(
     the on-disk filesystem type); if that is not allowed, it runs as the login user after a
     "# not run as root" line. Where findmnt is missing or too old (e.g. Alpine) part 2 says so.
     To see the whole fstab use get_fstab; for everything mounted now use get_mounts.
+    Mount options in the output can hold secrets (cifs password=, user=name%password).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     cmd = mount_problems_cmd()
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result, MOUNT_SECRET_PATTERNS)
 
 PRESSURE_CMD = (
     'for r in cpu io memory; do echo "== $r =="; '
@@ -2285,12 +2385,18 @@ def get_top(
     the summary and the top CPU consumers.
     On BusyBox hosts (Alpine), where top has no -c / -w, the output is plain `top -b -n 1`,
     cut to 30 lines too: its first line starts with '# BusyBox' and the columns differ.
+    Process command lines can hold secrets (--password=..., URLs with credentials).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     cmd = busybox_fallback(
         "top -b -n 2 -d 1 -c -w 512", "top", BUSYBOX_TOP_CMD,
         output_filter=TOP_SECOND_SAMPLE_FILTER,
     )
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 CPU_INFO_NO_LSCPU_HEADER = "# lscpu is not installed: summary of /proc/cpuinfo"
 # The /proc/cpuinfo lines that describe the CPU rather than one core: x86 names first,
@@ -2438,6 +2544,11 @@ def get_docker_logs(
     or 'YYYY-MM-DD HH:MM:SS' ('today' and 'yesterday' are not supported here).
     When the login user cannot reach the docker daemon (not root, not in the docker group),
     the command is run through passwordless sudo or doas (sudo -n / doas -n).
+    Log lines can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     if not is_valid_container_ref(container):
         return {"ok": False, "error": CONTAINER_ERROR}
@@ -2452,7 +2563,8 @@ def get_docker_logs(
         cmd += f" --since {shlex.quote(safe_since)}"
     # docker replays the container's stderr on stderr; merge to keep the lines in order
     cmd += f" {shlex.quote(container)} 2>&1"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 @mcp.tool()
 def get_docker_stats(
@@ -2510,6 +2622,11 @@ def get_docker_inspect(
     networks, ports, mounts and log driver. Environment variables are NOT returned.
     When the login user cannot reach the docker daemon (not root, not in the docker group),
     the command is run through passwordless sudo or doas (sudo -n / doas -n).
+    The entrypoint/cmd can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     if not is_valid_container_ref(container):
         return {"ok": False, "error": CONTAINER_ERROR}
@@ -2518,7 +2635,8 @@ def get_docker_inspect(
         f"inspect --type container --format {shlex.quote(DOCKER_INSPECT_FORMAT)} "
         f"{shlex.quote(container)}"
     )
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 # ---- Kubernetes: kubectl (cluster level) ----
 
@@ -3249,6 +3367,11 @@ def get_service_logs_from_journalctl(
     Gets recent journald logs for a specific systemd service.
     Optional since limits them to a time window: '30 min ago', '2 hours ago', 'today',
     'yesterday' or 'YYYY-MM-DD HH:MM:SS' (the last `lines` entries within it are returned).
+    Log lines can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     VALID_SERVICE_PATTERN = re.compile(r"^[a-zA-Z0-9.\-_@:]+$")
     if not VALID_SERVICE_PATTERN.match(service):
@@ -3266,7 +3389,8 @@ def get_service_logs_from_journalctl(
         if safe_since is None:
             return {"ok": False, "error": SINCE_ERROR}
         cmd += f" --since {shlex.quote(safe_since)}"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 def journal_errors_cmd(lines: int, current_boot_only: bool = False, safe_since: Optional[str] = None) -> str:
     """Builds the get_journal_errors command. The arguments must already be validated:
@@ -3297,6 +3421,11 @@ def get_journal_errors(
     With current_boot_only=True only entries since the last boot are returned.
     Optional since limits them to a time window: '30 min ago', '2 hours ago', 'today',
     'yesterday' or 'YYYY-MM-DD HH:MM:SS' (the last `lines` entries within it are returned).
+    Log lines can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     if not is_valid_lines(lines):
         return {"ok": False, "error": LINES_ERROR}
@@ -3309,7 +3438,8 @@ def get_journal_errors(
         if safe_since is None:
             return {"ok": False, "error": SINCE_ERROR}
     cmd = journal_errors_cmd(lines, current_boot_only, safe_since)
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result)
 
 JOURNAL_DISK_USAGE_PLAIN_NOTE = (
     "# not run as root (no sudo -n / doas -n access): "
@@ -3509,6 +3639,13 @@ HOST_OVERVIEW_SECTIONS = (
     ("listening_sockets", "get_listening_sockets", LISTENING_SOCKETS_CMD),
     ("journal_errors", "get_journal_errors", journal_errors_cmd(200)),
 )
+# the sections whose source tool redacts its output, with that tool's patterns
+HOST_OVERVIEW_REDACTED_TOOLS = {
+    "get_mount_problems": MOUNT_SECRET_PATTERNS,
+    "get_ps_aux_top_cpu_consumers": SECRET_PATTERNS,
+    "get_ps_aux_top_mem_consumers": SECRET_PATTERNS,
+    "get_journal_errors": SECRET_PATTERNS,
+}
 HOST_OVERVIEW_TIMEOUT_MAX_S = 120
 
 def tool_default_timeout(tool: str) -> int:
@@ -3544,6 +3681,10 @@ def get_host_overview(
     data.sections maps each section, in this order, to {source_tool, ok, exit_code, stdout,
     stderr, seconds} plus timed_out and error when that tool's result has them. seconds is
     the time of the section's SSH call as seen from this server.
+    mount_problems, top_cpu_processes, top_memory_processes and journal_errors are redacted
+    as their tools are: values that look like secrets (passwords, tokens, keys, credentials
+    in URLs) are replaced by '<redacted>' and redaction_replaced says how many; the
+    pattern-based caveats are in data.redaction_note.
     A section that does not apply to the host fails on its own (e.g. failed_units and
     journal_errors without systemd: exit code 127) and the others still run; ok is True
     when the host was reachable for every section, whatever the sections returned.
@@ -3561,6 +3702,8 @@ def get_host_overview(
         started = time.monotonic()
         section_timeout = tool_default_timeout(tool) if timeout is None else timeout
         result = run_ssh_command(host, user, cmd, port, password, key_path, section_timeout, accept_new_hostkey)
+        if tool in HOST_OVERVIEW_REDACTED_TOOLS:
+            result = redact_secrets_in_result(result, HOST_OVERVIEW_REDACTED_TOOLS[tool])
         data = result.get("data")
         if not isinstance(data, dict):
             # could not connect or authenticate: every other section would fail the same way
@@ -3581,8 +3724,11 @@ def get_host_overview(
             section["timed_out"] = True
         if result.get("error"):
             section["error"] = result["error"]
+        if "redaction" in result:
+            section["redaction_replaced"] = result["redaction"]["replaced"]
         sections[name] = section
-    return {"ok": True, "host": host, "collected_at_utc": collected_at, "data": {"sections": sections}}
+    return {"ok": True, "host": host, "collected_at_utc": collected_at,
+            "data": {"sections": sections, "redaction_note": REDACTION_NOTE}}
 ## == END OF TOOLS == ##
 
 

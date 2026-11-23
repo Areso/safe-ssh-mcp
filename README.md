@@ -10,6 +10,15 @@ In this project, "safe" refers specifically to host safety: the server is design
 
 The core philosophy behind this MCP server is safety first. Instead of providing an AI agent with an unrestricted bash shell, this server exposes only carefully curated, read-only commands for system diagnostics and monitoring.
 
+## Feedback
+
+Hi there!
+Using safe-ssh-mcp? I'd love to hear from you.
+
+Whether you're using it with Claude Code, Codex, Ollama, or another MCP client, please tell me what works and what doesn't. Even a two-sentence report is valuable.
+
+Share it in [GitHub Discussions](https://github.com/Areso/safe-ssh-mcp/discussions).
+
 ## Available Tools (Partial List)
 A few examples from each group; `<...>` marks a validated parameter.
 

@@ -125,3 +125,42 @@ def test_invalid_timeout(timeout, mock_run_ssh_command):
 @pytest.mark.parametrize("timeout", [1, 120])
 def test_timeout_bounds(timeout, mock_run_ssh_command):
     assert mcp_ssh.get_host_overview(host="h", user="u", timeout=timeout)["ok"] is True
+
+
+# ============================================================
+# Redaction: a section is redacted exactly when its source tool is
+# ============================================================
+
+SECRET_TEXT = "x --password=hunter2 //fs/s /m cifs user=bob%S3c,vers=3.0 0 0"
+
+
+def _tool_result(tool, mocker):
+    mock = mocker.patch("mcp_ssh.run_ssh_command", return_value=_ok(SECRET_TEXT))
+    result = getattr(mcp_ssh, tool)(host="h", user="u")
+    mocker.stop(mock)
+    return result
+
+
+def test_redacted_sections_are_those_whose_tool_redacts(mocker):
+    expected = {tool for _, tool, _ in SECTIONS if "redaction" in _tool_result(tool, mocker)}
+    assert set(mcp_ssh.HOST_OVERVIEW_REDACTED_TOOLS) == expected
+    assert expected == {"get_mount_problems", "get_ps_aux_top_cpu_consumers",
+                        "get_ps_aux_top_mem_consumers", "get_journal_errors"}
+
+
+def test_sections_are_redacted_like_their_tools(mocker):
+    """Same text in, same text out: a section redacts with its tool's patterns."""
+    tool_stdout = {tool: _tool_result(tool, mocker)["data"]["stdout"] for _, tool, _ in SECTIONS}
+    mocker.patch("mcp_ssh.run_ssh_command", side_effect=[_ok(SECRET_TEXT) for _ in SECTIONS])
+    result = mcp_ssh.get_host_overview(host="h", user="u")
+    for name, tool, _ in SECTIONS:
+        section = result["data"]["sections"][name]
+        assert section["stdout"] == tool_stdout[tool], name
+        if tool in mcp_ssh.HOST_OVERVIEW_REDACTED_TOOLS:
+            assert "hunter2" not in section["stdout"], name
+            assert section["redaction_replaced"] >= 1, name
+        else:
+            assert section["stdout"] == SECRET_TEXT, name
+            assert "redaction_replaced" not in section, name
+    assert "S3c" not in result["data"]["sections"]["mount_problems"]["stdout"]
+    assert result["data"]["redaction_note"] == mcp_ssh.REDACTION_NOTE

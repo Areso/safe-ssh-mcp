@@ -1,6 +1,6 @@
 # redact_secrets: values that look like secrets are redacted in free-text output
 
-Date: 2026-11-22
+Date: 2026-11-22, updated 2026-11-23
 Status: accepted
 
 ## Decision
@@ -16,7 +16,19 @@ a secret with `<redacted>` and adds a `redaction` field to the result:
 The field is there even when nothing was replaced, so the model always knows the output
 was filtered and that the filter is not a guarantee.
 
-Used by: `get_crontab_tasks`, `get_cron_jobs`.
+Used by 13 tools and four sections of `get_host_overview` (2026-11-23):
+
+- cron: `get_crontab_tasks`, `get_cron_jobs`;
+- systemd: `get_systemd_status`, `get_systemd_unit_definition`;
+- processes: `get_ps_aux_top_cpu_consumers`, `get_ps_aux_top_mem_consumers`, `get_top`;
+- journal: `get_service_logs_from_journalctl`, `get_journal_errors`;
+- docker: `get_docker_logs`, `get_docker_inspect`;
+- mounts: `get_fstab`, `get_mount_problems`.
+
+Some outputs have their own syntax and get a rule set of their own, run before the
+general rules: unit files (`SYSTEMD_SECRET_PATTERNS`) and mount options
+(`MOUNT_SECRET_PATTERNS`). Which tool uses which set, and which functions apply them:
+the table in [redact_mount_options.md](redact_mount_options.md#the-redaction-functions-and-where-each-rule-set-is-applied).
 
 ## Why
 
@@ -26,6 +38,14 @@ written as one-line shell commands, and credentials end up inline:
 `https://user:token@host`. `get_cron_jobs` reads the crontabs of every user as root, so
 without redaction one call would hand all of them to the model and to the MCP client's
 logs.
+
+The same holds wherever a command line or a log line is shown. On test VMs with planted
+secrets (2026-11-23, `scripts/redaction_test/`), before they redacted:
+`get_systemd_status` showed the `ExecStart=` arguments and the unit's last log lines; the
+ps tools, `get_top` and the overview showed process arguments (`--password=...`); the
+journal tools showed what services log; `get_docker_logs` and `get_docker_inspect`
+showed the container's output and command line; `get_fstab` and `get_mount_problems`
+showed cifs passwords in mount options.
 
 ## Trade-off
 
@@ -41,13 +61,37 @@ A was chosen because it removes most of the risk at little cost to diagnostics. 
 limit is stated wherever it is used: in the docstring of each tool, and in the `note`
 of every result. It must never be described as making output safe.
 
+What is caught (`SECRET_PATTERNS`, in this order): PEM private keys; `scheme://user:pw@host`
+and `scheme://:pw@host`; `Authorization:` headers and `Bearer` tokens; long options with a
+secret word, also after a prefix (`--password x`, `--db-password=x`, `--client-secret x`;
+not `--password-stdin` / `--password-file`, which take no secret); `mysql -pX`;
+`sshpass -p X`; `curl -u user:X`; names ending in `_KEY`, `_PWD` or `_PAT`
+(`STRIPE_KEY=`, `MYSQL_PWD=`, `GITHUB_PAT=`); names containing a secret word
+(`DB_PASSWORD=`, `password: x`, `"secret": "x"`); and, anywhere, tokens with a known
+prefix: `sk_live_` (Stripe), `ghp_` (GitHub), `xoxb-` (Slack), `AKIA` (AWS access key
+ID). A token keeps its prefix (`ghp_<redacted>`), so its kind stays visible, and needs a
+realistic length after it (`ghp_short` is left alone).
+
+A value is quoted, or runs to the next whitespace, quote or `;` (a shell command separator,
+and the field separator of connection strings such as `Password=x;Database=app`), so the
+command or field after it stays visible. Mount options end values at a comma instead; see
+[redact_mount_options.md](redact_mount_options.md).
+
+`_KEY` names that are not secrets are excluded by name: `PUBLIC_KEY`, `PRIMARY_KEY`,
+`FOREIGN_KEY`, `UNIQUE_KEY`, `SORT_KEY`, `PARTITION_KEY`, `ROUTING_KEY`, `CACHE_KEY`,
+`LOOKUP_KEY` (`_NOT_SECRET_KEYS`), also with a prefix (`db_primary_key`). A bare `PWD` /
+`OLDPWD` is the working directory and needs the underscore to count.
+
 Known false positives: a value after a word like `token` or `password` in log text
 (`invalid token: expired` hides `expired`), a port passed as `-pNNNN` to a MySQL
-client. Known misses: secrets in positional arguments (`app connect s3cret`), in
-variables whose names do not contain a secret-like word (`APP_PASS=`, `PASS=`: a bare
-`pass` is not a keyword, as it would also match `BYPASS`, `PASSTHROUGH`; `db_pass` is
-the one exception), base64 blobs without a key name, and anything split across lines
-except PEM private keys.
+client, a `_KEY` name not in the exclusion list (`HASH_KEY=id`), and `credentials=` with
+a file path (see [redact_mount_options.md](redact_mount_options.md)). Known misses:
+secrets in positional arguments (`app connect s3cret`), free text without `=` or `:`
+(`token s3cret`), a secret piped in (`echo s3cret | docker login --password-stdin`),
+variables whose names do not contain a secret word or suffix (`APP_PASS=`, `PASS=`: a
+bare `pass` is not a keyword, as it would also match `BYPASS`, `PASSTHROUGH`; `db_pass`
+is the one exception), token formats not in the prefix list, base64 blobs without a key
+name, and anything split across lines except PEM private keys.
 
 ## Where it runs
 
@@ -59,12 +103,24 @@ reach neither the model nor the client. The server does not log command output.
 
 - The patterns are `SECRET_PATTERNS` in `mcp_ssh.py`: one regex each, with a group
   `k` (kept), `v` (replaced) and optionally `s` (kept after). A narrow pattern must come
-  before a broad one that would match the same text.
+  before a broad one that would match the same text; the token-prefix rule comes last,
+  so a token that is the value of an assignment is counted once.
+- A rule that is only right for one kind of output (it would leak or over-redact
+  elsewhere) goes into a rule set of its own, `<rules> + SECRET_PATTERNS`, passed as
+  `patterns` by the tools that print that output: `SYSTEMD_SECRET_PATTERNS`,
+  `MOUNT_SECRET_PATTERNS`. Words and lists shared by several rules: `_SECRET_WORDS`,
+  `_NOT_SECRET_KEYS`, `_TOKEN_PREFIXES`.
 - Every pattern must skip a value that is already `<redacted>`, so that a value matched
   by two patterns is counted once and redacting twice changes nothing.
 - Each new pattern gets a positive and a negative case in `tests/test_redact.py`.
-- A new tool opts in by returning `redact_secrets_in_result(run_ssh_command(...))` and
-  saying so in its docstring.
+- A new tool opts in by returning `redact_secrets_in_result(run_ssh_command(...))` (with
+  its rule set when it has one), saying so in its docstring, and being added to
+  `REDACTING_TOOLS` in `tests/test_redact.py`, which fails until it is. A tool that is a
+  `get_host_overview` section also goes into `HOST_OVERVIEW_REDACTED_TOOLS`, with the
+  same rule set.
+- Live check: `scripts/redaction_test/` plants marked fake secrets (and non-secret
+  controls that must stay visible) on disposable Debian/Ubuntu and Alpine VMs and runs
+  every tool; see its README for adding a case.
 
 ## Related
 
@@ -72,9 +128,12 @@ reach neither the model nor the client. The server does not log command output.
   and blanks every `env` value, which is complete for that one field. Free text has no
   such structure, hence the pattern-based approach here. See
   [get_crictl_inspect.md](get_crictl_inspect.md).
-- The crictl and docker inspect tools leave secrets in command-line arguments as a known
-  gap ([get_crictl_inspect.md](get_crictl_inspect.md),
-  [get_docker_inspect.md](get_docker_inspect.md)); `redact_secrets` is a candidate to
-  close it.
+- [redact_mount_options.md](redact_mount_options.md): why mount options have their own
+  rules, and the table of which tool uses which function and rule set.
+- `get_docker_inspect` redacts its command line since 2026-11-23
+  ([get_docker_inspect.md](get_docker_inspect.md)). The crictl inspect tools still leave
+  secrets in command-line arguments as a known gap
+  ([get_crictl_inspect.md](get_crictl_inspect.md)); `redact_secrets` is a candidate to
+  close it there too.
 - [as_root.md](as_root.md): `get_cron_jobs` reads other users' files as root, which is
   why it redacts.

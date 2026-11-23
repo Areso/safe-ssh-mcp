@@ -24,6 +24,11 @@ They are returned because the command line is usually what you need to see when
 diagnosing a container, and there is no reliable way to tell which argument is a
 secret.
 
+Update 2026-11-23: the output now goes through `redact_secrets_in_result`, so arguments
+that look like secrets (`--password=...`, a connection string with a password) are
+replaced by `<redacted>`; the rest of the command line stays. A secret in an unusual form
+(a positional argument) is still shown. See [redact_secrets.md](redact_secrets.md).
+
 ## Where
 
 - `DOCKER_INSPECT_FORMAT` in `mcp_ssh.py`.

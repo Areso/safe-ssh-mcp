@@ -68,10 +68,10 @@ def test_leaves_harmless_text_alone(text):
 
 
 def test_pem_private_key_block_is_redacted_whole():
-    text = "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nAAAA\n-----END RSA PRIVATE KEY-----\nafter"
-    assert mcp_ssh.redact_secrets(text) == (
-        f"before\n-----BEGIN RSA PRIVATE KEY-----{R}-----END RSA PRIVATE KEY-----\nafter", 1
-    )
+    # built at run time like the tokens below: no key-shaped block in the source
+    begin, end = "-----BEGIN RSA " + "PRIVATE KEY-----", "-----END RSA " + "PRIVATE KEY-----"
+    text = f"before\n{begin}\nMIIEow\nAAAA\n{end}\nafter"
+    assert mcp_ssh.redact_secrets(text) == (f"before\n{begin}{R}{end}\nafter", 1)
 
 
 def test_counts_each_value_once():
@@ -125,3 +125,197 @@ def test_cron_tools_redact_their_output(tool, mock_run_ssh_command):
     result = tool(host="h", user="u")
     assert result["data"]["stdout"] == f"0 2 * * * mysqldump -p{R} db"
     assert result["redaction"]["replaced"] == 1
+
+
+@pytest.mark.parametrize("text, expected", [
+    ('Environment="API_TOKEN=a b" MODE=prod', f'Environment="API_TOKEN={R}" MODE=prod'),
+    ("Environment='DB_PASS=a b c'", f"Environment='DB_PASS={R}'"),
+    ('Environment="MODE=a b"', 'Environment="MODE=a b"'),
+    ("Environment=DB_PASSWORD=x MODE=prod", f"Environment=DB_PASSWORD={R} MODE=prod"),
+])
+def test_systemd_patterns_take_quoted_assignments_whole(text, expected):
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.SYSTEMD_SECRET_PATTERNS)[0] == expected
+
+
+def test_default_patterns_keep_the_command_after_a_quoted_assignment():
+    """The systemd rule is not in the default set: in a shell line it would hide the command."""
+    assert mcp_ssh.redact_secrets("sh -c 'DB_PASS=x ./run'")[0] == f"sh -c 'DB_PASS={R} ./run'"
+
+
+def test_in_result_uses_the_given_patterns():
+    result = {"ok": True, "data": {"command": "c", "exit_code": 0, "stdout": 'Environment="TOKEN=a b"', "stderr": ""}}
+    assert mcp_ssh.redact_secrets_in_result(result, mcp_ssh.SYSTEMD_SECRET_PATTERNS)["data"]["stdout"] == \
+        f'Environment="TOKEN={R}"'
+
+
+@pytest.mark.parametrize("text, expected", [
+    # found on the test VMs: a long option with a prefix before the word, a URL without a user
+    ("/usr/bin/app --db-password s3cret", f"/usr/bin/app --db-password {R}"),
+    ("app --client-secret=abc", f"app --client-secret={R}"),
+    ("redis://:s3cret@localhost:6379/0", f"redis://:{R}@localhost:6379/0"),
+    # options that take no secret stay as they are
+    ("docker login --password-stdin registry.example.com", "docker login --password-stdin registry.example.com"),
+    ("app --password-file /etc/pw", "app --password-file /etc/pw"),
+    ("http://host:8080/x", "http://host:8080/x"),
+    ("see https://example.com:443/a@b", "see https://example.com:443/a@b"),
+])
+def test_prefixed_long_options_and_userless_urls(text, expected):
+    assert mcp_ssh.redact_secrets(text)[0] == expected
+
+
+# Token-shaped test values are built at run time, so that no full token is in the source:
+# GitHub push protection blocks a push that contains one, fake or not.
+GHP = "ghp_" + "a1B2" * 9
+STRIPE = "sk_" + "live_" + "4eC39HqLyjWDarjtT1zdp7dc"
+SLACK = "xoxb-" + "1234-5678-abcdefghij"
+AWS_ID = "AKIA" + "IOSFODNN7EXAMPLE"
+
+
+@pytest.mark.parametrize("text, expected", [
+    # names ending in _KEY / _PWD / _PAT
+    ("STRIPE_KEY=abc", f"STRIPE_KEY={R}"),
+    ("SSH_KEY=abc", f"SSH_KEY={R}"),
+    ("export MYSQL_PWD=abc", f"export MYSQL_PWD={R}"),
+    ("GITHUB_PAT: abc", f"GITHUB_PAT: {R}"),
+    ("primary_key_secret=z", f"primary_key_secret={R}"),
+    # _KEY names that are not secrets, and the working directory
+    ("PRIMARY_KEY=id", "PRIMARY_KEY=id"),
+    ("db_primary_key: id", "db_primary_key: id"),
+    ("foreign_key: user_id", "foreign_key: user_id"),
+    ("SSH_PUBLIC_KEY=ssh-ed25519", "SSH_PUBLIC_KEY=ssh-ed25519"),
+    ("SORT_KEY=name PARTITION_KEY=day ROUTING_KEY=q CACHE_KEY=k LOOKUP_KEY=l UNIQUE_KEY=u",
+     "SORT_KEY=name PARTITION_KEY=day ROUTING_KEY=q CACHE_KEY=k LOOKUP_KEY=l UNIQUE_KEY=u"),
+    ("PWD=/root OLDPWD=/tmp", "PWD=/root OLDPWD=/tmp"),
+    # tokens by their prefix, the prefix kept
+    (f"curl -d k=1 {STRIPE}", f"curl -d k=1 sk_live_{R}"),
+    (f"git clone https://x {GHP}", f"git clone https://x ghp_{R}"),
+    (f"slack {SLACK}", f"slack xoxb-{R}"),
+    (f"key id {AWS_ID}", f"key id AKIA{R}"),
+    # too short or not the prefix: left alone
+    ("AKIASHORT ghp_short sk_live_x risk_live_abcdefghijkl", "AKIASHORT ghp_short sk_live_x risk_live_abcdefghijkl"),
+])
+def test_key_pwd_pat_names_and_token_prefixes(text, expected):
+    assert mcp_ssh.redact_secrets(text)[0] == expected
+
+
+@pytest.mark.parametrize("text", [
+    f"export AWS_ACCESS_KEY_ID={AWS_ID}",
+    f"STRIPE_KEY={STRIPE}",
+    f"GITHUB_PAT={GHP}",
+])
+def test_token_in_an_assignment_is_counted_once(text):
+    redacted, count = mcp_ssh.redact_secrets(text)
+    assert redacted == text.split("=")[0] + f"={R}"
+    assert count == 1
+
+
+def test_systemd_quoted_assignment_knows_the_suffix_names():
+    text = 'Environment="STRIPE_KEY=a b" "PRIMARY_KEY=c d"'
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.SYSTEMD_SECRET_PATTERNS)[0] == \
+        f'Environment="STRIPE_KEY={R}" "PRIMARY_KEY=c d"'
+
+
+# ============================================================
+# Which tools redact: a fixed list, so that adding or dropping redaction is a decision
+# ============================================================
+
+REDACTING_TOOLS = {
+    "get_crontab_tasks", "get_cron_jobs", "get_systemd_unit_definition", "get_systemd_status",
+    "get_ps_aux_top_cpu_consumers", "get_ps_aux_top_mem_consumers", "get_top",
+    "get_docker_logs", "get_docker_inspect", "get_service_logs_from_journalctl", "get_journal_errors",
+    "get_fstab", "get_mount_problems",
+}
+REQUIRED_ARGS = {
+    "abs_paths": ["/srv"], "daemon": "nginx", "container": "web", "pod": "web-1", "resource_type": "pod",
+    "name": "example.com", "container_id": "abcdef123456", "image": "nginx", "target_host": "example.com",
+    "target_port": 443, "service": "nginx",
+}
+
+
+def _registered_tools():
+    import asyncio
+    return [t.name for t in asyncio.run(mcp_ssh.mcp.list_tools())]
+
+
+def _call_with_secret_output(name, mock_run_ssh_command):
+    import inspect
+    mock_run_ssh_command.return_value = {
+        "ok": True, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": 0, "stdout": "app --password=hunter2", "stderr": "token=abc"},
+    }
+    fn = getattr(mcp_ssh, name)
+    params = inspect.signature(fn).parameters
+    args = {p: REQUIRED_ARGS[p] for p in params
+            if params[p].default is inspect.Parameter.empty and p not in ("host", "user")}
+    return fn(host="h", user="u", **args)
+
+
+def test_exactly_these_tools_redact(mock_run_ssh_command):
+    redacting = set()
+    for name in _registered_tools():
+        if name == "get_host_overview":
+            continue  # its sections are checked in test_overview.py
+        if "redaction" in _call_with_secret_output(name, mock_run_ssh_command):
+            redacting.add(name)
+    assert redacting == REDACTING_TOOLS
+
+
+@pytest.mark.parametrize("name", sorted(REDACTING_TOOLS))
+def test_redacting_tool_hides_stdout_and_stderr(name, mock_run_ssh_command):
+    result = _call_with_secret_output(name, mock_run_ssh_command)
+    assert result["data"]["stdout"] == f"app --password={R}"
+    assert result["data"]["stderr"] == f"token={R}"
+    assert result["redaction"] == {"replaced": 2, "note": mcp_ssh.REDACTION_NOTE}
+
+
+# ============================================================
+# Mount options (get_fstab, get_mount_problems)
+# ============================================================
+
+@pytest.mark.parametrize("text, expected", [
+    # cifs passwords: the options after the value stay visible
+    ("//fs/share /mnt/s cifs username=bob,password=S3c,vers=3.0,noauto 0 0",
+     f"//fs/share /mnt/s cifs username=bob,password={R},vers=3.0,noauto 0 0"),
+    ("//fs/s /mnt/s cifs pass=S3c,username=bob 0 0", f"//fs/s /mnt/s cifs pass={R},username=bob 0 0"),
+    ("//fs/s /m cifs password=a\\040b,password2=c,domain=CORP 0 0",
+     f"//fs/s /m cifs password={R},password2={R},domain=CORP 0 0"),
+    ("//fs/s /mnt/s cifs user=bob%S3c,noauto 0 0", f"//fs/s /mnt/s cifs user=bob%{R},noauto 0 0"),
+    # mount.cifs writes a comma inside a password as ",,"
+    ("//fs/s /m cifs password=ab,,cd,vers=3.0 0 0", f"//fs/s /m cifs password={R},vers=3.0 0 0"),
+    ("//fs/s /m cifs user=bob%ab,,cd,,,uid=1 0 0", f"//fs/s /m cifs user=bob%{R},uid=1 0 0"),
+    ("//fs/s /mnt/s cifs username=bob%S3c 0 0", f"//fs/s /mnt/s cifs username=bob%{R} 0 0"),
+    # credentials= is a file path, hidden all the same, but not the options after it
+    ("//fs/s /mnt/s cifs credentials=/etc/cifs.cred,uid=1000 0 0",
+     f"//fs/s /mnt/s cifs credentials={R},uid=1000 0 0"),
+    # nothing to hide
+    ("UUID=1 / ext4 errors=remount-ro 0 1", "UUID=1 / ext4 errors=remount-ro 0 1"),
+    ("https://dav/ /m davfs user,noauto,uid=1000 0 0", "https://dav/ /m davfs user,noauto,uid=1000 0 0"),
+    ("//fs/s /m cifs username=bob,noauto 0 0", "//fs/s /m cifs username=bob,noauto 0 0"),
+    # the general rules still apply
+    ("# old: mount -o password=x", f"# old: mount -o password={R}"),
+])
+def test_mount_patterns(text, expected):
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.MOUNT_SECRET_PATTERNS)[0] == expected
+
+
+@pytest.mark.parametrize("tool", [mcp_ssh.get_fstab, mcp_ssh.get_mount_problems])
+def test_mount_tools_use_the_mount_patterns(tool, mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": True, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": 0, "stdout": "//fs/s /m cifs user=bob%S3c,password=x,vers=3.0 0 0",
+                 "stderr": ""},
+    }
+    result = tool(host="h", user="u")
+    assert result["data"]["stdout"] == f"//fs/s /m cifs user=bob%{R},password={R},vers=3.0 0 0"
+    assert result["redaction"]["replaced"] == 2
+
+
+@pytest.mark.parametrize("text, expected", [
+    # found by the A/B run: the ';' after a value was taken as part of it
+    ("sh -c 'echo password=x; echo done'", f"sh -c 'echo password={R}; echo done'"),
+    ("0 1 * * * export API_KEY=x; /usr/bin/true", f"0 1 * * * export API_KEY={R}; /usr/bin/true"),
+    ("Server=db;Password=x;Database=app", f"Server=db;Password={R};Database=app"),
+    ("app --token=x;app2", f"app --token={R};app2"),
+])
+def test_value_ends_at_semicolon(text, expected):
+    assert mcp_ssh.redact_secrets(text)[0] == expected

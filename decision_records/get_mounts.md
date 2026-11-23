@@ -22,6 +22,10 @@ one overlay line per container, so it can be long.
 `findmnt --real` would cut that down, but it needs util-linux 2.33+ and hides
 tmpfs, so it was left out.
 
+Nor is it redacted: the kernel does not print cifs passwords in `/proc/mounts`. The tools
+that read `/etc/fstab` (`get_fstab`, `get_mount_problems`) do redact; see
+[redact_mount_options.md](redact_mount_options.md).
+
 ## Alternative
 
 A `real_only` switch that adds `--real` on request.

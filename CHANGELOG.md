@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
 
+## 0.3.1 - 2026-11-23
+### Added
+- `get_systemd_unit_definition`: a unit's definition as systemd reads it (`systemctl cat`):
+  the unit file and its drop-ins, with `ExecStart=`, `WorkingDirectory=`, `Restart=`,
+  `StandardOutput=` / `StandardError=` (where output goes when it is not in the journal)
+  and `EnvironmentFile=` (its path only; the file is not read). Secrets are redacted.
+- `scripts/redaction_test/`: plants fake secrets on disposable Debian/Ubuntu and Alpine VMs
+  and checks what every tool shows.
+
+### Changed
+- Secrets are now redacted by `get_systemd_status`, `get_ps_aux_top_cpu_consumers`,
+  `get_ps_aux_top_mem_consumers`, `get_top`, `get_docker_logs`, `get_docker_inspect`,
+  `get_service_logs_from_journalctl` and `get_journal_errors` (process command lines, log
+  lines), `get_fstab` and `get_mount_problems` (cifs `password=`, `pass=`, `password2=`,
+  `user=name%password` and `credentials=` in mount options, `,,` inside a password
+  included; the options after them stay visible, see
+  [decision_records/redact_mount_options.md](decision_records/redact_mount_options.md)),
+  and by the matching `get_host_overview` sections (`redaction_replaced` per section,
+  `redaction_note` in `data`).
+- Redaction also catches names ending in `_KEY`, `_PWD` and `_PAT` (`STRIPE_KEY`,
+  `MYSQL_PWD`, `GITHUB_PAT`; not `PRIMARY_KEY`, `PUBLIC_KEY`, `SORT_KEY` and other non-secret
+  keys), Stripe (`sk_live_`), GitHub (`ghp_`), Slack (`xoxb-`) and AWS (`AKIA`) tokens
+  anywhere (the prefix is kept), long options such as `--db-password x`, and URLs without
+  a user (`redis://:password@host`).
+
+### Fixed
+- Redaction took a `;` right after a secret as part of it, so `API_KEY=x; ./run` became
+  `API_KEY=<redacted> ./run` and `Password=x;Database=app` hid the database name. An
+  unquoted value now ends at `;`.
+
 ## 0.3.0 - 2026-11-23
 ### Added
 - `get_host_overview`: a broad first look at a host in one tool call, in 16 sections:
@@ -19,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails on its own and the others still run. `timeout`, when given, replaces every
   section's default limit. Output is not shortened (10-25 KB of JSON on the test VMs).
   See [decision_records/get_host_overview.md](decision_records/get_host_overview.md).
-- `LIBC_VERSION_CMD`: the command of `get_libc_version` as a shared constant (unchanged).
 - `get_cron_jobs`: every cron job of the host: `/etc/crontab`, `/etc/anacrontab`,
   `/etc/cron.d/*`, the crontab of every user (Debian `/var/spool/cron/crontabs`, RHEL
   `/var/spool/cron`, Alpine `/etc/crontabs`; a directory reached through a symlink is
@@ -28,36 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file. Runs through `sudo -n` / `doas -n` when the login user is not root and falls back
   to what the login user can read, with a `# not run as root` first line. See
   [decision_records/as_root.md](decision_records/as_root.md).
-- `get_crontab_tasks` and `get_cron_jobs` start with a line saying whether a cron daemon
-  is running (`cron`, `crond`, `fcron` or `dcron`, found in `/proc/<pid>/comm`):
-  `# cron daemon: running: cron (pid 612)`, `# cron daemon: NOT RUNNING ...: scheduled
-  jobs are not executed`, or `cannot tell` for a non-root user on a `/proc` mounted with
-  `hidepid`. Shared helper `cron_daemon_check_cmd`.
-- Redaction of secrets in free-text output: `redact_secrets` / `redact_secrets_in_result`
-  replace values that look like passwords, tokens, keys and credentials in URLs with
-  `<redacted>` and add a `redaction` field (`replaced` count and a note on its limits) to
-  the result. Pattern-based, so not complete. Used by `get_crontab_tasks` and
-  `get_cron_jobs`. See [decision_records/redact_secrets.md](decision_records/redact_secrets.md).
-
-### Fixed
-- Timeouts on BusyBox hosts (Alpine): BusyBox `timeout` stops only the process it
-  started, so the rest of a pipeline (`du | sort`) or a background job lived on. It kept
-  the SSH output open: the call hung until `timeout_s` + 5 s, returned
-  `Network error: Could not connect` with the output lost, and the processes kept running
-  on the host. Commands now run in their own session (`setsid`) with a watchdog that stops
-  the whole process group (TERM, then KILL 2 s later) and exits 124 like GNU timeout.
-  Hosts with GNU timeout keep using it, now with `-k 2`, so a command that ignores TERM
-  is killed too instead of running on. Checked on Debian 13, Ubuntu 24.04, Fedora 44,
-  CentOS Stream 10 and Alpine 3.24. See
-  [decision_records/remote_timeout.md](decision_records/remote_timeout.md).
-- Output that is still open after `timeout_s` + 5 s is no longer reported as a network
-  error: the result has `timed_out: true`, `output_never_ended: true`, the output that
-  arrived until then, and an error saying that processes may still run on the host.
-- `get_crontab_tasks` returned `ok: false` for a user without a crontab (`crontab -l`
-  exits 1). It now returns `# no crontab for the login user (<user>)` with exit code 0;
-  an empty crontab says so too. Other failures (permission denied, not allowed to use
-  crontab) still fail, with their message. Not done with `success_exit_codes=(0, 1)`,
-  which would have hidden those.
 - `get_fstab`: `/etc/fstab` as written, comments included.
 - `get_mount_problems`: checks every `/etc/fstab` entry against what is mounted now and
   prints one line per problem, then a summary (`no problems found (N fstab entries
@@ -94,6 +93,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `# not run as root` first line, if that is refused. Says `journalctl is not installed
   on this host` on hosts without systemd. See
   [decision_records/as_root.md](decision_records/as_root.md).
+- Redaction of secrets in free-text output: `redact_secrets` / `redact_secrets_in_result`
+  replace values that look like passwords, tokens, keys and credentials in URLs with
+  `<redacted>` and add a `redaction` field (`replaced` count and a note on its limits) to
+  the result. Pattern-based, so not complete. Used by `get_crontab_tasks` and
+  `get_cron_jobs`. See [decision_records/redact_secrets.md](decision_records/redact_secrets.md).
+
+### Changed
+- `get_crontab_tasks` (and the new `get_cron_jobs`) start with a line saying whether a
+  cron daemon is running (`cron`, `crond`, `fcron` or `dcron`, found in `/proc/<pid>/comm`):
+  `# cron daemon: running: cron (pid 612)`, `# cron daemon: NOT RUNNING ...: scheduled
+  jobs are not executed`, or `cannot tell` for a non-root user on a `/proc` mounted with
+  `hidepid`. Shared helper `cron_daemon_check_cmd`.
+- `get_crontab_tasks` redacts values that look like secrets (see Redaction above) and
+  its result has a `redaction` field.
+- On hosts with GNU timeout, commands run under `timeout -k 2`: a command that ignores
+  TERM is killed 2 s later instead of running on. See
+  [decision_records/remote_timeout.md](decision_records/remote_timeout.md).
+- A result can carry `output_never_ended: true` (see Fixed).
+- Internal: `LIBC_VERSION_CMD`, the command of `get_libc_version` as a shared constant
+  (the command is unchanged).
+
+### Fixed
+- Timeouts on BusyBox hosts (Alpine): BusyBox `timeout` stops only the process it
+  started, so the rest of a pipeline (`du | sort`) or a background job lived on. It kept
+  the SSH output open: the call hung until `timeout_s` + 5 s, returned
+  `Network error: Could not connect` with the output lost, and the processes kept running
+  on the host. Commands now run in their own session (`setsid`) with a watchdog that stops
+  the whole process group (TERM, then KILL 2 s later) and exits 124 like GNU timeout.
+  Hosts with GNU timeout keep using it. Checked on Debian 13, Ubuntu 24.04, Fedora 44,
+  CentOS Stream 10 and Alpine 3.24. See
+  [decision_records/remote_timeout.md](decision_records/remote_timeout.md).
+- Output that is still open after `timeout_s` + 5 s is no longer reported as a network
+  error: the result has `timed_out: true`, `output_never_ended: true`, the output that
+  arrived until then, and an error saying that processes may still run on the host.
+- `get_crontab_tasks` returned `ok: false` for a user without a crontab (`crontab -l`
+  exits 1). It now returns `# no crontab for the login user (<user>)` with exit code 0;
+  an empty crontab says so too. Other failures (permission denied, not allowed to use
+  crontab) still fail, with their message. Not done with `success_exit_codes=(0, 1)`,
+  which would have hidden those.
 
 ### Removed
 - `get_memory_pressure`, deprecated since 0.2.0: use `get_pressure`, which returns
