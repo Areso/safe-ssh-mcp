@@ -48,6 +48,9 @@ VARIANTS = {
     "get_iostat": [{"samples": 1, "interval": 2}],
     "get_mpstat": [{"samples": 1, "interval": 2}],
     "get_cpu_info": [{"include_flags": True}],
+    # REQUIRED gives it name="web-1"; name=None for a call by pid only
+    "get_process_info": [{"pid": 1, "name": None}, {"name": "sshd"}, {"pid": 1, "name": "systemd"},
+                         {"name": "Web Content"}],
 }
 # (name, command, timeout_s, expect_timeout); {n} is a sleep length unique to the run.
 # expect_timeout "rejected": the timeout is out of bounds, so nothing may run on the host
@@ -106,7 +109,7 @@ def worker_commands(module_dir):
     for name, fn in tools.items():
         for extra in [{}] + VARIANTS.get(name, []):
             calls.clear()
-            result = fn(**_base_kwargs(fn, "h", "u"), **extra)
+            result = fn(**{**_base_kwargs(fn, "h", "u"), **extra})  # a variant overrides REQUIRED
             key = name + (json.dumps(extra, sort_keys=True) if extra else "")
             out[key] = {"calls": list(calls), "result_error": result.get("error")}
     out["_wrapper"] = mcp_ssh.timeout_wrapped("echo 'a b'; ls", 17) if hasattr(mcp_ssh, "timeout_wrapped") else None

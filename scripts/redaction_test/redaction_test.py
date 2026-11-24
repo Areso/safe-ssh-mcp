@@ -110,7 +110,7 @@ MARKERS = {
     "ZQM06": ("secret", "fstab cifs password=x,,y (after the doubled comma)"),
     "ZQX10": ("control", "fstab cifs file_mode=x after a ,, password, must stay"),
     # debian: process arguments
-    "ZQP01": ("secret", "busy loop --password=x (top CPU)"),
+    "ZQP01": ("secret", "busy loop --password=x (top CPU, get_process_info by its pid)"),
     "ZQP02": ("secret", "150 MB python --token=x (top memory; may be OOM-killed on 512 MB)"),
     "ZQP03": ("secret", "listening python --password=x"),
     # debian: docker container leakdocker
@@ -137,7 +137,7 @@ MARKERS = {
     "ZQB03": ("secret", "root crontab ftp://user:x@host"),
     "ZQB04": ("secret", "periodic script contents (only its name is listed)"),
     "ZQB05": ("secret", "syslog password=x (no tool reads /var/log/messages)"),
-    "ZQP11": ("secret", "busy loop --password=x (top CPU)"),
+    "ZQP11": ("secret", "busy loop --password=x (top CPU, get_process_info by its pid)"),
     "ZQM11": ("secret", "fstab cifs password=x"),
     "ZQM12": ("secret", "fstab cifs user=bob%x,,y (before the doubled comma)"),
     "ZQM13": ("secret", "fstab cifs user=bob%x,,y (after the doubled comma)"),
@@ -193,10 +193,11 @@ MUST_REDACT = {
                ("get_crontab_tasks", None), ("get_cron_jobs", None), ("get_ps_aux_top_cpu_consumers", None),
                ("get_top", None), ("get_service_logs_from_journalctl", "leakfail"), ("get_journal_errors", None),
                ("get_docker_logs", None), ("get_docker_inspect", None), ("get_host_overview", None),
-               ("get_fstab", None), ("get_mount_problems", None), ("get_lockfiles", "include_contents")},
+               ("get_fstab", None), ("get_mount_problems", None), ("get_lockfiles", "include_contents"),
+               ("get_process_info", None)},
     "alpine": {("get_crontab_tasks", None), ("get_cron_jobs", None), ("get_ps_aux_top_cpu_consumers", None),
                ("get_top", None), ("get_host_overview", None), ("get_fstab", None),
-               ("get_mount_problems", None), ("get_lockfiles", "include_contents")},
+               ("get_mount_problems", None), ("get_lockfiles", "include_contents"), ("get_process_info", None)},
     "k8s": {("get_kubectl_logs", None), ("get_crictl_logs", None), ("get_kubectl_describe", None)},
 }
 # values for required parameters; the leak units and container are the interesting ones
@@ -217,6 +218,8 @@ EXTRA_CALLS = [
 # profile -> tool -> the arguments of its one call, in place of REQUIRED. {pod} and {cid} are
 # looked up on the node when check starts (the pod name has a random suffix).
 PROFILE_ARGS = {
+    "debian": {"get_process_info": {"pid": "{busy}"}},
+    "alpine": {"get_process_info": {"pid": "{busy}"}},
     "k8s": {
         "get_kubectl_logs": {"pod": "{pod}", "namespace": "zqleak"},
         "get_kubectl_describe": {"resource_type": "pod", "name": "{pod}", "namespace": "zqleak"},
@@ -230,6 +233,9 @@ PROFILE_EXTRA_CALLS = {
 }
 # what {pod} and {cid} are: read-only lookups, run through the server's own run_ssh_command
 LOOKUPS = {
+    # [b]usy: the pattern does not match the command line of the shell running pgrep
+    "debian": {"busy": "pgrep -f '[b]usy --password=ZQP01' | head -n 1"},
+    "alpine": {"busy": "pgrep -f '[b]usy --password=ZQP11' | head -n 1"},
     "k8s": {"pod": "kubectl -n zqleak get pod -l app=leakpod -o name | cut -d/ -f2",
             "cid": "crictl ps --name leak -q | head -n 1"},
 }
@@ -264,7 +270,9 @@ def ssh_script(target, key, script):
 
 def tool_calls(profile, found):
     overrides = PROFILE_ARGS.get(profile, {})
-    fill = lambda args: {k: v.format(**found) if isinstance(v, str) else v for k, v in args.items()}
+    def fill(args):
+        filled = {k: v.format(**found) if isinstance(v, str) else v for k, v in args.items()}
+        return {k: int(v) if k == "pid" else v for k, v in filled.items()}
     calls = []
     for tool in asyncio.run(mcp_ssh.mcp.list_tools()):
         fn = getattr(mcp_ssh, tool.name)

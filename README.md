@@ -67,6 +67,7 @@ A few examples from each group; `<...>` marks a validated parameter.
 - get_distroname_version : `cat /etc/os-release`
 - get_installed_packages : `dpkg-query -W` (with source package), `rpm -qa --qf` (with epoch and source RPM) or `/lib/apk/db/installed` (with origin)
 - get_process_files : `/proc/<pid>/exe` and `/proc/<pid>/maps` of every process, with the package that owns each file
+- get_process_info : one process by `pid` and/or `name`: `ps` (state, elapsed time, threads, wait channel, command line), `/proc/<pid>/status`, `cgroup`, open files against `limits`, `oom_score`, `io` (command line redacted; never the environment)
 - get_failed_logins : `lastb -F -n <lines>`
 - get_coredumps : `coredumpctl list --no-pager`
 - get_cron_jobs : `/etc/crontab`, `/etc/cron.d/*` and every user's crontab (secrets redacted), with a check that a cron daemon runs

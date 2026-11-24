@@ -51,6 +51,7 @@ Counters and kernel state, no user data. Not redacted.
 | `/proc/sys/kernel/hostname` | `get_hostname` (when `uname -n` fails) |
 | `/proc/<pid>/comm` | `get_cron_jobs`, `get_crontab_tasks` (is a cron daemon running), `get_process_files` |
 | `/proc/<pid>/maps`, `readlink /proc/<pid>/exe` | `get_process_files`: only the paths of mapped executable files, not memory |
+| `/proc/<pid>/comm`, `status` (selected fields), `cgroup`, `limits`, `oom_score`, `oom_score_adj`, `io`; `ls -A /proc/<pid>/fd` (counted) | `get_process_info`: one process, PID validated; not `environ`, not the fd targets ([get_process_info.md](get_process_info.md)) |
 
 ### 2. Fixed system files
 

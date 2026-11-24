@@ -120,6 +120,17 @@ The alternative, a fixed list of commands such as `cat /proc/*/maps`, was reject
 the shell expands the glob before sudo sees it, so the rule would have to allow `cat`
 on any path, which is worse.
 
+`get_process_info` (added 2026-11-24) does the same for one process: any user can read
+`status`, `cgroup`, `limits` and `oom_score` of every process, but `/proc/<pid>/fd` and
+`/proc/<pid>/io` only of their own. The script is `sh -c '<PROCESS_INFO_SCRIPT>' sh PID NAME`,
+so a sudoers rule has to match the script and allow any two arguments. "No such process" and
+"the PID has another name" exit 3 and are returned as they are, not re-run as the login user.
+The fallback line is:
+
+```
+# not run as root (no sudo -n / doas -n access): open files and I/O of other users' processes are not readable
+```
+
 `get_journalctl_disk_usage` (added 2026-11-22) does the same. `journalctl --disk-usage`
 works for any user, but it only adds up the journal files that user can read: usually
 just its own user journal, unless it is in the `systemd-journal` or `adm` group. The

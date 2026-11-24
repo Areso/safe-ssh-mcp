@@ -1173,3 +1173,51 @@ def test_normalize_since_rejects_non_ascii_digits(since):
 def test_normalize_since_docker_and_kubernetes_reject_non_ascii_digits(since):
     assert mcp_ssh.normalize_since_docker(since) is None
     assert mcp_ssh.normalize_since_kubernetes(since) is None
+
+
+# ============================================================
+# get_process_info — pid / name validation
+# ============================================================
+
+class TestProcessInfoValidation:
+
+    def test_neither_pid_nor_name(self, mock_run_ssh_command):
+        assert mcp_ssh.get_process_info(host="h", user="u") == {"ok": False, "error": "Give pid, or name, or both"}
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("pid", [0, -1, mcp_ssh.PID_MAX + 1, "123", 1.5, True])
+    def test_invalid_pid(self, pid, mock_run_ssh_command):
+        assert mcp_ssh.get_process_info(host="h", user="u", pid=pid) == {"ok": False, "error": mcp_ssh.PID_ERROR}
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("name, reason", [
+        ("", "it is empty"),
+        ("systemd-journald", "it is 16 characters long"),
+        (" nginx", "starts or ends with a space"),
+        ("nginx ", "starts or ends with a space"),
+        ("x;reboot", "it contains ';'"),
+        ("a$(id)", "'$'"),
+        ("a`id`", "'`'"),
+        ("x|y", "'|'"),
+        ("x'y", '"\'"'),
+        ("a*", "'*'"),
+        ("n\nx", "'\\n'"),
+        ("café", "'é'"),
+        (5, "must be a string, got int"),
+        (["nginx"], "must be a string, got list"),
+    ])
+    def test_invalid_name(self, name, reason, mock_run_ssh_command):
+        result = mcp_ssh.get_process_info(host="h", user="u", name=name)
+        assert result["ok"] is False and reason in result["error"]
+        assert mcp_ssh.PROCESS_NAME_RULES in result["error"]
+        mock_run_ssh_command.assert_not_called()
+
+    @pytest.mark.parametrize("name", ["nginx", "php-fpm8.2", "kube-apiserver", "(sd-pam)", "kworker/0:1H",
+                                      "systemd-journal", "Web Content", "gmain", "user@1000", "a+b", "x"])
+    def test_valid_name(self, name, mock_run_ssh_command):
+        mcp_ssh.get_process_info(host="h", user="u", name=name)
+        mock_run_ssh_command.assert_called_once()
+
+    def test_valid_pid_and_name_together(self, mock_run_ssh_command):
+        mcp_ssh.get_process_info(host="h", user="u", pid=1, name="systemd")
+        mock_run_ssh_command.assert_called_once()

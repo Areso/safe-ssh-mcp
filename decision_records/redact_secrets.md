@@ -18,7 +18,7 @@ was filtered and that the filter is not a guarantee.
 
 ## Which tools redact, with which function and patterns
 
-As of 2026-11-24: 18 tools redact free text, 2 redact structured JSON, and 4 sections of
+As of 2026-11-24: 19 tools redact free text, 2 redact structured JSON, and 4 sections of
 `get_host_overview` are redacted as their tools are. Every other tool returns its output
 as it is.
 
@@ -53,6 +53,7 @@ The rule sets (all in `mcp_ssh.py`):
 | processes | `get_ps_aux_top_cpu_consumers` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
 | processes | `get_ps_aux_top_mem_consumers` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
 | processes | `get_top` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| processes | `get_process_info` | `redact_secrets_in_result` | `SECRET_PATTERNS` (the command line); see [get_process_info.md](get_process_info.md) |
 | journal | `get_service_logs_from_journalctl` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
 | journal | `get_journal_errors` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
 | docker | `get_docker_logs` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
@@ -71,8 +72,8 @@ The rule sets (all in `mcp_ssh.py`):
 
 `tests/test_redact.py::test_exactly_these_tools_redact` fails when a tool starts or stops
 adding a `redaction` field without `REDACTING_TOOLS` being updated (`get_lockfiles`, which
-redacts only with a parameter, and the crictl inspect tools, which add no field, have tests
-of their own), and `tests/test_overview.py` checks that each redacted overview section
+redacts only with a parameter, `get_process_info`, which needs a pid or a name, and the crictl
+inspect tools, which add no field, have tests of their own), and `tests/test_overview.py` checks that each redacted overview section
 matches its tool's output. Update this table with them.
 
 ## Why

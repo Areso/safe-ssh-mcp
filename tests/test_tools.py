@@ -1,6 +1,7 @@
 """Tests that every MCP tool handler passes the correct command to run_ssh_command."""
 import os
 import shutil
+import shlex
 import subprocess
 
 import pytest
@@ -2587,3 +2588,78 @@ def test_systemd_unit_definition_redacts_secrets(mock_run_ssh_command):
 def test_systemd_unit_definition_keeps_error_results(mock_run_ssh_command):
     mock_run_ssh_command.return_value = {"ok": False, "error": "Network error"}
     assert mcp_ssh.get_systemd_unit_definition(daemon="x", host="h", user="u") == {"ok": False, "error": "Network error"}
+
+
+# ============================================================
+# get_process_info — one process by pid and/or name
+# ============================================================
+
+def test_process_info_passes_pid_and_name_as_script_arguments(mock_run_ssh_command):
+    mcp_ssh.get_process_info(host="h", user="u", pid=1460292, name="Web Content")
+    cmd = mock_run_ssh_command.call_args[0][2]
+    assert cmd == mcp_ssh.process_info_cmd(1460292, "Web Content")
+    # the values are arguments of the fixed script, quoted, never part of it
+    assert cmd.startswith(f"S={shlex.quote(mcp_ssh.PROCESS_INFO_SCRIPT)}; ")
+    assert """sh -c "$S" sh 1460292 'Web Content'""" in cmd
+    assert "Web Content" not in mcp_ssh.PROCESS_INFO_SCRIPT
+
+
+@pytest.mark.parametrize("pid, name, args", [(42, None, "42 ''"), (None, "nginx", "'' nginx")])
+def test_process_info_missing_argument_is_empty(pid, name, args, mock_run_ssh_command):
+    mcp_ssh.get_process_info(host="h", user="u", pid=pid, name=name)
+    assert mock_run_ssh_command.call_args[0][2].endswith(f'sh -c "$S" sh {args}')
+
+
+def test_process_info_tries_root_first_and_falls_back_with_a_note():
+    cmd = mcp_ssh.process_info_cmd(1, None)
+    root, plain = cmd.split(mcp_ssh.AS_ROOT_PREFIX)[1].split("; fi; fi; ")
+    assert root.startswith('if [ -n "$AS_ROOT" ]; then out=$($AS_ROOT sh -c "$S" sh 1 \'\' 2>/dev/null)')
+    # "not found" (exit 3) from the root run is the answer: no plain re-run
+    assert f'[ "$rc" -eq {mcp_ssh.PROCESS_INFO_NOT_FOUND} ]' in root
+    assert plain == (f'if [ "$(id -u)" != 0 ]; then echo {shlex.quote(mcp_ssh.PROCESS_INFO_PLAIN_NOTE)}; fi; '
+                     """sh -c "$S" sh 1 ''""")
+
+
+def test_process_info_script_reads_no_environment():
+    assert "environ" not in mcp_ssh.PROCESS_INFO_SCRIPT.replace("The environment", "")
+    assert "/fd\"" in mcp_ssh.PROCESS_INFO_SCRIPT  # only counted: ls -A, grep -c
+
+
+def test_process_info_script_is_valid_sh():
+    for script in (mcp_ssh.PROCESS_INFO_SCRIPT, mcp_ssh.process_info_cmd(7, "nginx")):
+        assert subprocess.run(["sh", "-n", "-c", script]).returncode == 0
+
+
+@pytest.mark.parametrize("stdout, error", [
+    ("no process with PID 4000000\n", "no process with PID 4000000"),
+    ("# not run as root (no sudo -n / doas -n access): ...\nPID 1 is 'systemd', not 'nginx': the process may "
+     "have exited and its PID been given to another one\n",
+     "PID 1 is 'systemd', not 'nginx': the process may have exited and its PID been given to another one"),
+    ("", "Process not found"),
+])
+def test_process_info_not_found_becomes_the_error(stdout, error, mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": False, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": mcp_ssh.PROCESS_INFO_NOT_FOUND, "stdout": stdout, "stderr": ""},
+    }
+    result = mcp_ssh.get_process_info(host="h", user="u", pid=1, name="nginx")
+    assert result["ok"] is False and result["error"] == error
+
+
+def test_process_info_keeps_a_timeout_error(mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": False, "host": "h", "collected_at_utc": "t", "error": "The command probably timed out",
+        "data": {"command": "c", "exit_code": 124, "stdout": "", "stderr": ""},
+    }
+    assert mcp_ssh.get_process_info(host="h", user="u", pid=1)["error"] == "The command probably timed out"
+
+
+def test_process_info_redacts_the_command_line(mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": True, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": 0, "stderr": "",
+                 "stdout": "=== PID 7 (sh)\n# ps\n  7  1 root R 0 9 sh -c loop busy --password=hunter2\n"},
+    }
+    result = mcp_ssh.get_process_info(host="h", user="u", pid=7)
+    assert "hunter2" not in result["data"]["stdout"] and "--password=<redacted>" in result["data"]["stdout"]
+    assert result["redaction"]["replaced"] == 1

@@ -3335,6 +3335,169 @@ def get_process_files(
     cmd = PROCESS_FILES_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+# A process name is matched against /proc/<pid>/comm: what ps shows as COMM, at most 15
+# characters (the kernel cuts longer names: systemd-journald is "systemd-journal"). The kernel
+# allows nearly any byte there; this is the set real names use, so that a name never brings
+# shell or regex syntax (it is compared as a string on the host, not passed to pgrep).
+PROCESS_NAME_MAX = 15
+PROCESS_NAME_CHARS = r"A-Za-z0-9._@:+/()\-"
+PROCESS_NAME_PATTERN = re.compile(rf"[{PROCESS_NAME_CHARS}]([{PROCESS_NAME_CHARS} ]*[{PROCESS_NAME_CHARS}])?")
+PROCESS_NAME_RULES = (
+    f"A process name is its COMM, as ps shows it: at most {PROCESS_NAME_MAX} characters "
+    "(longer names are cut by the kernel, e.g. 'systemd-journal' for systemd-journald), "
+    "ASCII letters, digits and . _ - : / @ + ( ), spaces only inside (e.g. nginx, php-fpm8.2, "
+    "kube-apiserver, (sd-pam))."
+)
+
+def process_name_error(name: Any) -> Optional[str]:
+    """Says what is wrong with a process name, or returns None when it is valid."""
+    if not isinstance(name, str):
+        return f"Invalid name: it must be a string, got {type(name).__name__}. {PROCESS_NAME_RULES}"
+    if name == "":
+        return f"Invalid name: it is empty. {PROCESS_NAME_RULES}"
+    shown = repr(name[:40]) + ("..." if len(name) > 40 else "")
+    if len(name) > PROCESS_NAME_MAX:
+        return f"Invalid name {shown}: it is {len(name)} characters long. {PROCESS_NAME_RULES}"
+    if not PROCESS_NAME_PATTERN.fullmatch(name):
+        bad = sorted(set(re.sub(rf"[{PROCESS_NAME_CHARS} ]", "", name)))
+        what = f"it contains {', '.join(repr(c) for c in bad)}" if bad else "it starts or ends with a space"
+        return f"Invalid name {shown}: {what}. {PROCESS_NAME_RULES}"
+    return None
+
+# At most this many processes are described when name matches several (php-fpm workers).
+PROCESS_INFO_MAX_PROCESSES = 5
+# The exit code of PROCESS_INFO_SCRIPT for "no such process" and "the PID has another name",
+# with the reason on stdout: unlike a sudo refusal, it must not trigger the plain re-run.
+PROCESS_INFO_NOT_FOUND = 3
+# /proc/<pid>/status fields worth showing; the rest (signal masks, NUMA lists) is noise
+PROCESS_INFO_STATUS_FIELDS = (
+    "Name", "State", "Tgid", "PPid", "Uid", "Gid", "Threads", "VmPeak", "VmSize", "VmHWM",
+    "VmRSS", "RssAnon", "RssFile", "RssShmem", "VmSwap", "voluntary_ctxt_switches",
+    "nonvoluntary_ctxt_switches", "CapEff", "NoNewPrivs", "Seccomp", "Cpus_allowed_list",
+)
+# $1 = pid or '', $2 = name or '': validated by the tool, passed as arguments, never as code.
+# Not /proc/<pid>/environ (where secrets are), and of /proc/<pid>/fd only the count.
+PROCESS_INFO_SCRIPT = r"""pid=$1; name=$2; max=@MAX@; notfound=@NOTFOUND@
+me=$(id -un)
+if [ "$(id -u)" = 0 ]; then seen=; else seen=" for $me (not root: other users' processes are hidden if /proc is mounted with hidepid)"; fi
+if [ -n "$pid" ]; then
+    if ! { IFS= read -r comm < "/proc/$pid/comm"; } 2>/dev/null; then echo "no process with PID $pid$seen"; exit "$notfound"; fi
+    if [ -n "$name" ] && [ "$comm" != "$name" ]; then
+        echo "PID $pid is '$comm', not '$name': the process may have exited and its PID been given to another one"
+        exit "$notfound"
+    fi
+    pids=$pid
+else
+    pids=$(for d in /proc/[0-9]*; do { IFS= read -r c < "$d/comm"; } 2>/dev/null || continue; [ "$c" = "$name" ] && echo "${d#/proc/}"; done | sort -n)
+    [ -n "$pids" ] || { echo "no process named '$name'$seen"; exit "$notfound"; }
+    n=$(printf '%s\n' "$pids" | wc -l | tr -d ' ')
+    if [ "$n" -gt "$max" ]; then
+        echo "# $n processes are named '$name': the $max with the lowest PIDs are shown"
+        pids=$(printf '%s\n' "$pids" | head -n "$max")
+    fi
+fi
+for p in $pids; do
+    d=/proc/$p
+    { IFS= read -r comm < "$d/comm"; } 2>/dev/null || { echo "=== PID $p: exited"; continue; }
+    echo "=== PID $p ($comm)"
+    echo "# ps"
+    if ps -V 2>&1 | grep -q procps; then
+        ps -ww -p "$p" -o pid,ppid,user,stat,ni,etimes,lstart,%cpu,%mem,rss,vsz,nlwp,wchan:32,args
+    else
+        echo "# BusyBox ps: no %CPU, %MEM, threads or wait channel; ELAPSED is the time since it started"
+        ps -o pid,ppid,user,stat,nice,etime,time,rss,vsz,args | awk -v p="$p" 'NR == 1 || $1 == p'
+    fi
+    echo "# $d/status"
+    grep -E '^(@FIELDS@):' "$d/status" 2>/dev/null
+    echo "# $d/cgroup (the systemd unit or container the process belongs to)"
+    cat "$d/cgroup" 2>/dev/null
+    echo "# open file descriptors ($d/fd), to compare with Max open files in limits"
+    if fds=$(ls -A "$d/fd" 2>/dev/null); then echo "open: $(printf '%s\n' "$fds" | grep -c .)"; else echo "open: not readable by $me"; fi
+    echo "# $d/limits"
+    cat "$d/limits" 2>/dev/null || echo "not readable by $me"
+    echo "# $d/oom_score, oom_score_adj"
+    echo "oom_score: $(cat "$d/oom_score" 2>/dev/null)"
+    echo "oom_score_adj: $(cat "$d/oom_score_adj" 2>/dev/null)"
+    echo "# $d/io (bytes the process made the disk read and write)"
+    cat "$d/io" 2>/dev/null || echo "not readable by $me"
+done""".replace("@MAX@", str(PROCESS_INFO_MAX_PROCESSES)).replace(
+    "@NOTFOUND@", str(PROCESS_INFO_NOT_FOUND)).replace("@FIELDS@", "|".join(PROCESS_INFO_STATUS_FIELDS))
+PROCESS_INFO_PLAIN_NOTE = (
+    "# not run as root (no sudo -n / doas -n access): open files and I/O of other users' "
+    "processes are not readable"
+)
+
+def process_info_cmd(pid: Optional[int], name: Optional[str]) -> str:
+    """The command of get_process_info. pid and name must have been validated (is_valid_pid,
+    process_name_error); they reach the script as its arguments $1 and $2."""
+    script = f'sh -c "$S" sh {shlex.quote("" if pid is None else str(pid))} {shlex.quote(name or "")}'
+    return (
+        f"S={shlex.quote(PROCESS_INFO_SCRIPT)}; {AS_ROOT_PREFIX}"
+        # through sudo/doas first; "not found" (exit 3) is an answer, a refusal is not
+        f'if [ -n "$AS_ROOT" ]; then out=$($AS_ROOT {script} 2>/dev/null); rc=$?; '
+        f'if [ "$rc" -eq 0 ] || [ "$rc" -eq {PROCESS_INFO_NOT_FOUND} ]; then '
+        """printf '%s\\n' "$out"; exit "$rc"; fi; fi; """
+        f"""if [ "$(id -u)" != 0 ]; then echo {shlex.quote(PROCESS_INFO_PLAIN_NOTE)}; fi; {script}"""
+    )
+
+@mcp.tool()
+def get_process_info(
+    host: str,
+    user: str,
+    pid: Optional[int] = None,
+    name: Optional[str] = None,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = TIMEOUT_DEFAULT_S,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Details of ONE process on a remote Linux host via SSH, given by pid or by name. Use
+    get_ps_aux_top_cpu_consumers, get_ps_aux_top_mem_consumers or get_top first to find it.
+    Give pid, or name, or both: with both, the process is described only if that PID still
+    has that name (a PID from an earlier call may have been given to another process after
+    a restart). name is matched exactly against the process name (COMM in ps, at most 15
+    characters, e.g. nginx, php-fpm8.2); when several processes have it, the 5 with the
+    lowest PIDs are described.
+    Per process, in sections starting with '#':
+    - ps: PID, PPID, user, state (D = waiting on I/O, Z = zombie), nice, elapsed seconds and
+      start time, %CPU, %MEM, RSS, VSZ, threads, wait channel, command line. On BusyBox
+      (Alpine) fewer columns.
+    - /proc/<pid>/status: state, parent, uids, threads, memory now and at its peak (VmHWM),
+      swap used (VmSwap), context switches (many non-voluntary ones: CPU contention),
+      capabilities, NoNewPrivs, seccomp.
+    - /proc/<pid>/cgroup: the systemd unit or container the process belongs to.
+    - open file descriptors (the count) and /proc/<pid>/limits: compare with Max open files.
+    - /proc/<pid>/oom_score and oom_score_adj: who the OOM killer picks first.
+    - /proc/<pid>/io: bytes read and written (root, or the process owner).
+    The environment of the process is not shown. If the login user is not root, the tool
+    runs through sudo -n / doas -n; if that is not allowed, it runs as the login user after
+    a '# not run as root' line, and open files and I/O of other users' processes are then
+    not readable.
+    Process command lines can hold secrets (--password=..., URLs with credentials).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
+    """
+    if pid is None and name is None:
+        return {"ok": False, "error": "Give pid, or name, or both"}
+    if pid is not None and not is_valid_pid(pid):
+        return {"ok": False, "error": PID_ERROR}
+    if name is not None:
+        error = process_name_error(name)
+        if error:
+            return {"ok": False, "error": error}
+    cmd = process_info_cmd(pid, name)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    data = result.get("data")
+    if isinstance(data, dict) and data.get("exit_code") == PROCESS_INFO_NOT_FOUND and "error" not in result:
+        # the script's reason: "no process with PID 123", "PID 123 is 'bash', not 'nginx': ..."
+        lines = (data.get("stdout") or "").strip().splitlines()
+        result["error"] = lines[-1] if lines else "Process not found"
+    return redact_secrets_in_result(result)
+
 @mcp.tool()
 def get_ip_addr(
     host: str,

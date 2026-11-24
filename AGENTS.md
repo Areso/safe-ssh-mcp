@@ -15,6 +15,14 @@ scripts that cover what changed.
 | SSH, the remote wrapper, `timeout_wrapped` / `TIMEOUT_SCRIPT`, `_run_cmd` | `scripts/ab_test/ab_test.py fleet` and `timeouts` |
 | redaction (patterns, rule sets, which tools redact) | `scripts/redaction_test/redaction_test.py plant` then `check`, and `scripts/ab_test/ab_test.py fleet` (on output nobody planted, the only differences must be values that became `<redacted>`: check each one is a secret or an accepted over-redaction) |
 
+- After changing a shared definition (a constant, pattern or validator such as
+  `PROCESS_NAME_CHARS`, `*_PATTERN`, `is_valid_*`, `*_error`, `_SECRET_WORDS`, `AS_ROOT_PREFIX`),
+  queue a check of every tool it affects: find them with `grep -n NAME mcp_ssh.py`, following
+  helper functions up to the `@mcp.tool()` functions, then run `scripts/ab_test/ab_test.py commands`
+  and `fleet` and check that those tools behave the same except where the change meant otherwise.
+  List the affected tools in the report. If `fleet` calls them only with placeholder arguments
+  (`REQUIRED` in `ab_test.py`), add `VARIANTS` that hit the changed case (a value at the edge of the
+  pattern, e.g. a name with `-` or a space), or compare HEAD and the working tree on real objects.
 - When a fix adds a new case, add it to the live script too (a marker in
   `scripts/redaction_test/`, a scenario in `scripts/ab_test/`), not only to the unit tests.
 - The live scripts need disposable test VMs (see each script's README). If none are
