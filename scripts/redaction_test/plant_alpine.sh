@@ -30,6 +30,12 @@ cat >> /etc/fstab <<FSTAB
 //fs.example.com/zq5 /mnt/zq5 cifs username=bob,password=ZQM11,domain=ZQX09,noauto 0 0
 //fs.example.com/zq6 /mnt/zq6 cifs user=bob%ZQM12,,ZQM13,nofail 0 0
 FSTAB
+mkdir -p /srv/zqleak
+cat > /srv/zqleak/requirements.txt <<REQ
+--index-url https://deploy:ZQL11@pypi.example.com/simple
+git+https://ZQL12abcdef@gitlab.example.com/org/lib.git#egg=lib
+secretstorage==ZQX16
+REQ
 '
 
 # a busy process with secrets in its arguments, as the login user

@@ -2,7 +2,7 @@
 
 Plants fake secrets on disposable VMs in the places where real ones turn up (unit files,
 drop-ins, crontabs, `/etc/cron.d`, cifs entries in `/etc/fstab`, process arguments, the
-journal, a docker container), runs
+journal, a docker container, lockfiles under `/srv/zqleak`), runs
 every tool against them and reports which secrets each tool shows.
 
 ```sh

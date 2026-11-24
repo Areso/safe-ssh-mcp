@@ -11,6 +11,7 @@ userdel -r appuser 2>/dev/null
 rm -f /etc/cron.d/leaktest /etc/cron.d/leaktokens
 sed -i '/ZQE01/d' /etc/crontab
 sed -i '\|/mnt/zq|d' /etc/fstab
+rm -rf /srv/zqleak
 systemctl daemon-reload
 pkill -f 'ZQP0' 2>/dev/null
 command -v docker >/dev/null 2>&1 && docker rm -f leakdocker >/dev/null 2>&1

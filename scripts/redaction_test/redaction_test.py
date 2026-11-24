@@ -142,16 +142,32 @@ MARKERS = {
     "ZQM12": ("secret", "fstab cifs user=bob%x,,y (before the doubled comma)"),
     "ZQM13": ("secret", "fstab cifs user=bob%x,,y (after the doubled comma)"),
     "ZQX09": ("control", "fstab cifs domain=x after password=, must stay"),
+    "ZQL11": ("secret", "lockfile requirements.txt --index-url https://user:x@host"),
+    "ZQL12": ("secret", "lockfile requirements.txt git+https://x@host (token as user name)"),
+    "ZQX16": ("control", "lockfile requirements.txt secretstorage==x, must stay"),
+    # both profiles: lockfiles under /srv/zqleak, read by get_lockfiles(include_contents=True)
+    "ZQL01": ("secret", "lockfile requirements.txt --index-url https://user:x@host"),
+    "ZQL02": ("secret", "lockfile requirements.txt --extra-index-url https://__token__:x@host"),
+    "ZQL03": ("secret", "lockfile requirements.txt git+https://x@host (token as user name)"),
+    "ZQL04": ("secret", "lockfile requirements.txt name @ https://x@host/pkg.whl"),
+    "ZQL05": ("secret", "lockfile requirements.txt git+https://ghp_x@github.com"),
+    "ZQL06": ("secret", "lockfile package-lock.json resolved https://user:x@registry"),
+    "ZQX12": ("control", "lockfile requirements.txt secretstorage==x, must stay"),
+    "ZQX13": ("control", "lockfile requirements.txt ${x} placeholder in an index URL, must stay"),
+    "ZQX14": ("control", "lockfile requirements.txt git+ssh://x@host user name, must stay"),
+    "ZQX15": ("control", 'lockfile package-lock.json "js-tokens": "x" version, must stay'),
 }
 # profile -> (tool, args) -> controls that tool must show
 CONTROLS = {
     "debian": {("get_systemd_unit_definition", "leaktest"): ["ZQX01", "ZQX02"],
                ("get_crontab_tasks", None): ["ZQX11"],
                ("get_cron_jobs", None): ["ZQX03", "ZQX04", "ZQX11"],
-               ("get_fstab", None): ["ZQX07", "ZQX08", "ZQX10"]},
+               ("get_fstab", None): ["ZQX07", "ZQX08", "ZQX10"],
+               ("get_lockfiles", "include_contents"): ["ZQX12", "ZQX13", "ZQX14", "ZQX15"]},
     "alpine": {("get_crontab_tasks", None): ["ZQX05", "ZQX06"],
                ("get_cron_jobs", None): ["ZQX05", "ZQX06"],
-               ("get_fstab", None): ["ZQX09"]},
+               ("get_fstab", None): ["ZQX09"],
+               ("get_lockfiles", "include_contents"): ["ZQX16"]},
 }
 # profile -> the calls (tool, daemon or service arg) whose output always holds a planted
 # secret: when one of them replaced nothing, the planting did not land
@@ -161,10 +177,10 @@ MUST_REDACT = {
                ("get_crontab_tasks", None), ("get_cron_jobs", None), ("get_ps_aux_top_cpu_consumers", None),
                ("get_top", None), ("get_service_logs_from_journalctl", "leakfail"), ("get_journal_errors", None),
                ("get_docker_logs", None), ("get_docker_inspect", None), ("get_host_overview", None),
-               ("get_fstab", None), ("get_mount_problems", None)},
+               ("get_fstab", None), ("get_mount_problems", None), ("get_lockfiles", "include_contents")},
     "alpine": {("get_crontab_tasks", None), ("get_cron_jobs", None), ("get_ps_aux_top_cpu_consumers", None),
                ("get_top", None), ("get_host_overview", None), ("get_fstab", None),
-               ("get_mount_problems", None)},
+               ("get_mount_problems", None), ("get_lockfiles", "include_contents")},
 }
 # values for required parameters; the leak units and container are the interesting ones
 REQUIRED = {
@@ -177,7 +193,15 @@ EXTRA_CALLS = [
     ("get_systemd_status", {"daemon": "leakfail"}),
     ("get_systemd_unit_definition", {"daemon": "leakfail"}),
     ("get_service_logs_from_journalctl", {"service": "leaktest"}),
+    ("get_lockfiles", {"abs_paths": ["/srv/zqleak"], "include_contents": True}),
 ]
+
+
+def call_key(tool, args):
+    """(tool, what tells its calls apart) as in CONTROLS and MUST_REDACT: the unit or
+    service, or "include_contents" for get_lockfiles printing the files."""
+    return (tool, args.get("daemon") or args.get("service")
+            or ("include_contents" if args.get("include_contents") else None))
 
 
 def parse_target(text):
@@ -229,10 +253,10 @@ def check(target, key):
             leaked = [m for m in shown if m in in_checked and MARKERS.get(m, ("secret",))[0] == "secret"]
             if leaked:
                 problems.append("LEAKED " + ", ".join(f"{m} ({MARKERS.get(m, ('', '?'))[1]})" for m in leaked))
-            call = (tool, args.get("daemon") or args.get("service"))
+            call = call_key(tool, args)
             if call in MUST_REDACT[target["profile"]] and not replaced:
                 problems.append("replaced nothing: did plant run?")
-        key_args = (tool, args.get("daemon"))
+        key_args = call_key(tool, args)
         if r.get("ok") and key_args in CONTROLS[target["profile"]]:
             missing = [m for m in CONTROLS[target["profile"]][key_args] if m not in shown]
             if missing:

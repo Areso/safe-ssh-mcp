@@ -108,6 +108,25 @@ cat >> /etc/fstab <<'FSTAB'
 FSTAB
 systemctl daemon-reload
 
+# ---- lockfiles: credentials in URLs (get_lockfiles with include_contents) ----
+mkdir -p /srv/zqleak
+cat > /srv/zqleak/requirements.txt <<'REQ'
+--index-url https://deploy:ZQL01@pypi.example.com/simple
+--extra-index-url https://__token__:ZQL02@pypi2.example.com/simple
+git+https://ZQL03abcdef@gitlab.example.com/org/lib.git@v1.2#egg=lib
+mylib @ https://ZQL04@files.example.com/mylib-1.0-py3-none-any.whl
+git+https://@GHP@ZQL05bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@github.com/org/lib2.git
+secretstorage==ZQX12
+-i https://deploy:${ZQX13}@nexus.example.com/simple
+git+ssh://ZQX14@git.example.com/org/repo.git
+REQ
+cat > /srv/zqleak/package-lock.json <<'JSON'
+{"packages": {"node_modules/js-tokens": {"version": "4.0.0",
+  "resolved": "https://npm:ZQL06@registry.example.com/js-tokens/-/js-tokens-4.0.0.tgz"},
+  "node_modules/loose-envify": {"requires": {"js-tokens": "ZQX15"}}}}
+JSON
+fill_tokens /srv/zqleak/requirements.txt
+
 # ---- processes with secrets in their arguments (nice 19: the busy loop still tops an idle host) ----
 pkill -f 'ZQP0' 2>/dev/null || true
 nohup nice -n 19 sh -c 'while :; do :; done' busy --password=ZQP01 >/dev/null 2>&1 &

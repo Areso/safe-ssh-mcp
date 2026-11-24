@@ -319,3 +319,76 @@ def test_mount_tools_use_the_mount_patterns(tool, mock_run_ssh_command):
 ])
 def test_value_ends_at_semicolon(text, expected):
     assert mcp_ssh.redact_secrets(text)[0] == expected
+
+
+# ============================================================
+# Lockfiles (get_lockfiles with include_contents): URLs and token prefixes only
+# ============================================================
+
+@pytest.mark.parametrize("text, expected", [
+    # requirements*.txt: index URLs with a user and a password or token
+    ("--index-url https://deploy:s3cret@pypi.example.com/simple",
+     f"--index-url https://deploy:{R}@pypi.example.com/simple"),
+    ("--extra-index-url https://__token__:pypiAgEIcHlwaQ@pypi.example.com/simple/",
+     f"--extra-index-url https://__token__:{R}@pypi.example.com/simple/"),
+    ("-i https://u:p@nexus/simple", f"-i https://u:{R}@nexus/simple"),
+    # a token as the user name alone, in a VCS or direct URL
+    ("git+https://glpat-AbCdEf123456@gitlab.example.com/org/lib.git@v1.2#egg=lib",
+     f"git+https://{R}@gitlab.example.com/org/lib.git@v1.2#egg=lib"),
+    ("mylib @ https://abcdef0123456789@files.example.com/mylib-1.0-py3-none-any.whl",
+     f"mylib @ https://{R}@files.example.com/mylib-1.0-py3-none-any.whl"),
+    (f"git+https://{GHP}@github.com/org/lib.git", f"git+https://{R}@github.com/org/lib.git"),
+    # other lockfiles keep registry credentials in URLs too
+    ("  remote: https://user:pass@gems.contribsys.com/", f"  remote: https://user:{R}@gems.contribsys.com/"),
+    ('  "resolved": "https://u:p@registry.example.com/x/-/x-1.0.0.tgz",',
+     f'  "resolved": "https://u:{R}@registry.example.com/x/-/x-1.0.0.tgz",'),
+    # a bare token by its prefix
+    (f"# {GHP}", f"# ghp_{R}"),
+])
+def test_lockfile_patterns_redact(text, expected):
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.LOCKFILE_SECRET_PATTERNS)[0] == expected
+
+
+@pytest.mark.parametrize("text", [
+    # package names and versions the general rules would break
+    "secretstorage==3.3.3",
+    "tokenizers==0.15.0",
+    "django-password-reset==1.0 --hash=sha256:0123abcd",
+    '    "node_modules/js-tokens": {',
+    'name = "keyring"\nversion = "25.0"',
+    # ${VAR} placeholders are filled in by pip from the environment: not secrets
+    "-i https://deploy:${PIP_TOKEN}@nexus.example.com/simple",
+    "--index-url https://${PIP_USER}:${PIP_PASSWORD}@nexus.example.com/simple",
+    "git+https://${GITHUB_TOKEN}@github.com/org/lib.git",
+    # an ssh user name, a git ref after @, scoped npm packages
+    "git+ssh://git@github.com/org/repo.git",
+    "git+https://github.com/org/lib.git@v1.2#egg=lib",
+    '  "resolved": "https://registry.npmjs.org/@babel/core/-/core-7.0.0.tgz",',
+    '  resolved "https://registry.yarnpkg.com/@babel/core/-/core-7.0.0.tgz#abc"',
+    "  remote: https://rubygems.org/",
+])
+def test_lockfile_patterns_keep_lockfiles_intact(text):
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.LOCKFILE_SECRET_PATTERNS) == (text, 0)
+
+
+LOCKFILE_OUTPUT = (
+    "===== /srv/app/requirements.txt (120 bytes) =====\n"
+    "--index-url https://deploy:s3cret@pypi.example.com/simple\n"
+    "secretstorage==3.3.3\n"
+    "tokenizers==0.15.0\n"
+)
+
+
+def test_lockfiles_with_contents_use_the_lockfile_patterns(mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": True, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": 0, "stdout": LOCKFILE_OUTPUT, "stderr": ""},
+    }
+    result = mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/srv/app"], include_contents=True)
+    assert result["data"]["stdout"] == LOCKFILE_OUTPUT.replace("s3cret", R)
+    assert result["redaction"] == {"replaced": 1, "note": mcp_ssh.REDACTION_NOTE}
+
+
+def test_lockfiles_listing_is_not_redacted(mock_run_ssh_command):
+    # without include_contents the output is `ls -l` of the files found: names, no contents
+    assert "redaction" not in mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/srv/app"])

@@ -16,18 +16,22 @@ a secret with `<redacted>` and adds a `redaction` field to the result:
 The field is there even when nothing was replaced, so the model always knows the output
 was filtered and that the filter is not a guarantee.
 
-Used by 13 tools and four sections of `get_host_overview` (2026-11-23):
+Used by 14 tools and four sections of `get_host_overview` (2026-11-24):
 
 - cron: `get_crontab_tasks`, `get_cron_jobs`;
 - systemd: `get_systemd_status`, `get_systemd_unit_definition`;
 - processes: `get_ps_aux_top_cpu_consumers`, `get_ps_aux_top_mem_consumers`, `get_top`;
 - journal: `get_service_logs_from_journalctl`, `get_journal_errors`;
 - docker: `get_docker_logs`, `get_docker_inspect`;
-- mounts: `get_fstab`, `get_mount_problems`.
+- mounts: `get_fstab`, `get_mount_problems`;
+- lockfiles: `get_lockfiles`, with `include_contents=True` only.
 
 Some outputs have their own syntax and get a rule set of their own, run before the
 general rules: unit files (`SYSTEMD_SECRET_PATTERNS`) and mount options
-(`MOUNT_SECRET_PATTERNS`). Which tool uses which set, and which functions apply them:
+(`MOUNT_SECRET_PATTERNS`). Lockfiles get one INSTEAD of the general rules
+(`LOCKFILE_SECRET_PATTERNS`: credentials in URLs and token prefixes only), as the general
+rules break package names such as `secretstorage==3.3.3`; see
+[redact_lockfiles.md](redact_lockfiles.md). Which tool uses which set, and which functions apply them:
 the table in [redact_mount_options.md](redact_mount_options.md#the-redaction-functions-and-where-each-rule-set-is-applied).
 
 ## Why
@@ -115,7 +119,8 @@ reach neither the model nor the client. The server does not log command output.
 - Each new pattern gets a positive and a negative case in `tests/test_redact.py`.
 - A new tool opts in by returning `redact_secrets_in_result(run_ssh_command(...))` (with
   its rule set when it has one), saying so in its docstring, and being added to
-  `REDACTING_TOOLS` in `tests/test_redact.py`, which fails until it is. A tool that is a
+  `REDACTING_TOOLS` in `tests/test_redact.py`, which fails until it is (a tool that
+  redacts only with a parameter, as `get_lockfiles`, gets a test of its own instead). A tool that is a
   `get_host_overview` section also goes into `HOST_OVERVIEW_REDACTED_TOOLS`, with the
   same rule set.
 - Live check: `scripts/redaction_test/` plants marked fake secrets (and non-secret
@@ -140,4 +145,6 @@ reach neither the model nor the client. The server does not log command output.
 - [no_arbitrary_file_read.md](no_arbitrary_file_read.md): no tool prints a file the caller
   names, since redaction cannot be trusted on files of unknown format. It lists every tool
   that does read a file, whether it redacts, and the tools still not redacted
-  (`get_lockfiles` contents, `get_kubectl_logs`, `get_kubectl_describe`).
+  (`get_kubectl_logs`, `get_kubectl_describe`).
+- [redact_lockfiles.md](redact_lockfiles.md): the lockfile rule set, used instead of
+  `SECRET_PATTERNS`, not after it.

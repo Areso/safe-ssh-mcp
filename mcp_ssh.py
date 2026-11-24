@@ -1023,6 +1023,7 @@ _NOT_SECRET_KEYS = r"(?:public|primary|foreign|unique|sort|partition|routing|cac
 _SECRET_SUFFIX_NAME = rf"(?![A-Za-z0-9_.]*?(?<![A-Za-z0-9]){_NOT_SECRET_KEYS}\b)[A-Za-z0-9_.]*_(?:key|pwd|pat)"
 _TOKEN_PREFIXES = r"(?:sk_live_|ghp_|xoxb-|AKIA)"
 _TOKEN_BODY = r"(?:(?<=sk_live_)[A-Za-z0-9]{10,}|(?<=ghp_)[A-Za-z0-9]{30,}|(?<=xoxb-)[A-Za-z0-9-]{10,}|(?<=AKIA)[A-Z0-9]{16})"
+_TOKEN_PREFIX_RULE = rf"(?P<k>\b{_TOKEN_PREFIXES})(?P<v>{_TOKEN_BODY})\b"
 # Each pattern has a group k (kept), a group v (replaced) and, optionally, a group s (kept).
 # The order matters: a narrow rule runs before the broad one that would match the same text.
 SECRET_PATTERNS = tuple(re.compile(pattern, flags) for pattern, flags in (
@@ -1049,7 +1050,7 @@ SECRET_PATTERNS = tuple(re.compile(pattern, flags) for pattern, flags in (
     (rf"(?P<k>\b[A-Za-z0-9_.-]*{_SECRET_WORDS}[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)(?P<v>{_SECRET_VALUE})", re.IGNORECASE),
     # sk_live_..., ghp_..., xoxb-..., AKIA... anywhere, by the token's own prefix. Last, so that
     # a token already replaced as the value of an assignment is not counted twice.
-    (rf"(?P<k>\b{_TOKEN_PREFIXES})(?P<v>{_TOKEN_BODY})\b", 0),
+    (_TOKEN_PREFIX_RULE, 0),
 ))
 # Unit files quote a whole assignment: Environment="DB_PASSWORD=a b" MODE=prod. There the
 # value runs to the closing quote, spaces included. Only for systemd output: in a shell line
@@ -1067,6 +1068,20 @@ MOUNT_SECRET_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in 
     rf"(?P<k>(?<![^\s,])(?:password2?|passwd|pass|credentials?)=)(?P<v>{_MOUNT_OPTION_VALUE})",
     rf"(?P<k>(?<![^\s,])user(?:name)?=[^\s,%]*%)(?P<v>{_MOUNT_OPTION_VALUE})",
 )) + SECRET_PATTERNS
+# Lockfiles (get_lockfiles with include_contents) are read by programs, and the general rules
+# would corrupt them: secretstorage==3.3.3, tokenizers==0.15.0 and "js-tokens": { look like a
+# secret name with a value. So they get only rules for credentials in URLs, where a
+# requirements*.txt keeps them (--index-url https://user:token@host, git+https://token@host),
+# and the token prefixes. A ${VAR} placeholder, filled in by pip from the environment, is not
+# a secret and stays visible. See decision_records/redact_lockfiles.md.
+_URL_PLACEHOLDER = r"\$\{[A-Za-z0-9_]+\}(?=@)"
+LOCKFILE_SECRET_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    # scheme://user:password@host
+    rf"(?P<k>\b[a-z][a-z0-9+.-]*://[^\s/:@'\"]*:)(?P<v>(?!<redacted>)(?!{_URL_PLACEHOLDER})[^\s@/'\"]+)(?=@)",
+    # http(s)://token@host, git+https://token@host: there a user name alone is a token
+    # (in ssh://git@host it is a plain user name, and stays)
+    rf"(?P<k>\b(?:[a-z][a-z0-9.-]*\+)?https?://)(?P<v>(?!<redacted>)(?!{_URL_PLACEHOLDER})[^\s/:@'\"]+)(?=@)",
+)) + (re.compile(_TOKEN_PREFIX_RULE),)
 REDACTION_NOTE = (
     f"Values that look like secrets (passwords, tokens, keys, credentials in URLs) were replaced "
     f"with '{REDACTED}'. Redaction is pattern-based: a secret written in an unusual form may "
@@ -1302,6 +1317,11 @@ def get_lockfiles(
     take the output over 10 MB in total, gets a '===== <path> (skipped: ...) =====' line instead.
     The output can be several MB - call without include_contents first to see the sizes,
     then narrow abs_paths to the application you need.
+    With include_contents=True, credentials in URLs (--index-url https://user:<redacted>@host,
+    git+https://<redacted>@host) and known token prefixes are replaced by '<redacted>', and
+    redaction.replaced says how many; the sizes in the '=====' lines are those of the files
+    on disk. Only these forms are caught, so that package names and versions stay intact:
+    a secret written another way is still shown. ${VAR} placeholders stay visible.
     """
     FORBIDDEN_CHARS = r'[|&;<>()$`{}]'
     MAX_PATHS = 10
@@ -1354,6 +1374,8 @@ def get_lockfiles(
         host, user, cmd, port, password, key_path, timeout, accept_new_hostkey,
         success_exit_codes=(0, 1) # find returns 1 on partial permission denied
     )
+    if include_contents:
+        result = redact_secrets_in_result(result, LOCKFILE_SECRET_PATTERNS)
     if result["ok"]:
         result["paths"] = normalized_paths
     return result
