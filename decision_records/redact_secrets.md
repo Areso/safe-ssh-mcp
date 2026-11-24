@@ -137,3 +137,7 @@ reach neither the model nor the client. The server does not log command output.
   close it there too.
 - [as_root.md](as_root.md): `get_cron_jobs` reads other users' files as root, which is
   why it redacts.
+- [no_arbitrary_file_read.md](no_arbitrary_file_read.md): no tool prints a file the caller
+  names, since redaction cannot be trusted on files of unknown format. It lists every tool
+  that does read a file, whether it redacts, and the tools still not redacted
+  (`get_lockfiles` contents, `get_kubectl_logs`, `get_kubectl_describe`).
