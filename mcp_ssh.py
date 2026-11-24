@@ -8,7 +8,7 @@ import configparser
 import json
 import os
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, ContextManager, List, Tuple
+from typing import Optional, Dict, Any, Callable, ContextManager, List, Tuple
 from contextlib import contextmanager
 import signal
 import threading
@@ -1103,20 +1103,81 @@ def redact_secrets(text: str, patterns: Tuple[re.Pattern, ...] = SECRET_PATTERNS
     return text, count
 
 def redact_secrets_in_result(result: Dict[str, Any],
-                             patterns: Tuple[re.Pattern, ...] = SECRET_PATTERNS) -> Dict[str, Any]:
+                             patterns: Tuple[re.Pattern, ...] = SECRET_PATTERNS,
+                             redactor: Optional[Callable[[str], Tuple[str, int]]] = None) -> Dict[str, Any]:
     """Redacts the stdout and stderr of a run_ssh_command result in place and adds a
     "redaction" field with the number of values replaced and REDACTION_NOTE. A result
-    without output (validation or connection error) is returned unchanged."""
+    without output (validation or connection error) is returned unchanged. redactor, when
+    given, is used instead of redact_secrets with patterns (e.g. redact_k8s_describe)."""
+    if redactor is None:
+        redactor = lambda text: redact_secrets(text, patterns)
     data = result.get("data")
     if not isinstance(data, dict):
         return result
     replaced = 0
     for stream in ("stdout", "stderr"):
         if isinstance(data.get(stream), str):
-            data[stream], n = redact_secrets(data[stream], patterns)
+            data[stream], n = redactor(data[stream])
             replaced += n
     result["redaction"] = {"replaced": replaced, "note": REDACTION_NOTE}
     return result
+
+# kubectl describe prints the environment of each container as an indented block:
+#     Environment:
+#       DB_PASSWORD:   s3cret
+#       TLS_KEY:       line 1
+#                      line 2                 <- a multi-line value goes on, indented deeper
+#       API_TOKEN:     <set to the key 'token' in secret 'db'>  Optional: false
+#       POD_IP:         (v1:status.podIP)
+# Every literal value is replaced, as the crictl inspect tools do: a variable's name does not
+# tell whether its value is a secret (MODE=x). References to a secret, a config map or a field
+# hold no value and say where it comes from, so they are kept. The rest of the output goes
+# through SECRET_PATTERNS (Command, Args). See decision_records/get_kubectl_describe_pod.md.
+_K8S_ENV_HEADER = re.compile(r"^(?P<i>[ \t]*)Environment:[ \t]*$")
+_K8S_ENV_ENTRY = re.compile(r"^(?P<k>(?P<i>[ \t]+)[A-Za-z_][A-Za-z0-9_.-]*:[ \t]+)(?P<v>\S.*)$")
+_K8S_ENV_REFERENCE = re.compile(
+    r"^<set to the key '[^']*' (?:in secret|of config map) '[^']*'>(?:\s+Optional: (?:true|false))?$"
+    r"|^\([a-z0-9]+:[^)]*\)$"                 # fieldRef: (v1:status.podIP)
+    r"|\((?:limits|requests)\.[A-Za-z0-9.-]+\)$")  # resourceFieldRef: node allocatable (limits.cpu)
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+def redact_k8s_describe(text: str) -> Tuple[str, int]:
+    """Redacts kubectl describe output: every literal value in an Environment: block (with
+    the continuation lines of a multi-line value), then SECRET_PATTERNS on the other lines.
+    Returns the text and how many values were replaced."""
+    lines, out, other, count, i = text.split("\n"), [], [], 0, 0
+    def flush_other():
+        nonlocal count
+        if other:
+            redacted, n = redact_secrets("\n".join(other))
+            out.append(redacted)
+            count += n
+            other.clear()
+    while i < len(lines):
+        header = _K8S_ENV_HEADER.match(lines[i])
+        other.append(lines[i])
+        i += 1
+        if not header:
+            continue
+        flush_other()
+        entry_indent, hiding = None, False
+        while i < len(lines) and lines[i].strip() and _indent(lines[i]) > len(header["i"]):
+            line, entry = lines[i], _K8S_ENV_ENTRY.match(lines[i])
+            if entry and entry_indent in (None, len(entry["i"])):
+                entry_indent = len(entry["i"])
+                hiding = entry["v"] != REDACTED and not _K8S_ENV_REFERENCE.search(entry["v"].strip())
+                out.append(entry["k"] + REDACTED if hiding else line)
+                count += hiding
+            elif entry_indent is not None and _indent(line) > entry_indent:
+                if not hiding:  # a continuation line: dropped with the value it belongs to
+                    out.append(line)
+            else:
+                break
+            i += 1
+    flush_other()
+    return "\n".join(out), count
 
 ## == START OF TOOLS == ##
 
@@ -2704,6 +2765,11 @@ def get_kubectl_logs(
     previous=True returns logs of the previous, crashed instance - use it for CrashLoopBackOff.
     Optional since limits them to a time window: '30 min ago', '2 hours ago', '30m', '1h30m'
     or an absolute UTC time 'YYYY-MM-DDTHH:MM:SSZ'.
+    Log lines can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     if not is_valid_dns_subdomain(pod):
         return {"ok": False, "error": K8S_NAME_ERROR}
@@ -2729,7 +2795,8 @@ def get_kubectl_logs(
         flag = "--since" if is_go_duration(safe_since) else "--since-time"
         cmd += f" {flag}={shlex.quote(safe_since)}"
     cmd += f" {shlex.quote(pod)}"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(
+        run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey))
 
 @mcp.tool()
 def get_kubectl_describe(
@@ -2753,6 +2820,12 @@ def get_kubectl_describe(
     storageclass, horizontalpodautoscaler, poddisruptionbudget (plural and short names like
     'po', 'deploy', 'svc' work too). Secrets and configmaps are NOT available.
     namespace is ignored for cluster-scoped resources (node, namespace, persistentvolume, storageclass).
+    Every literal environment value (Environment: blocks of pods and pod templates) is
+    replaced by '<redacted>', the variable names are kept; references to a secret, config map
+    or field are shown as they are, since they hold no value. In the rest of the output (Command,
+    Args) values that look like secrets are replaced the same way; that part is pattern-based:
+    a secret in an unusual form may still be shown, and a harmless value may be hidden.
+    The "redaction" field of the result says how many values were replaced.
     """
     safe_type = normalize_k8s_resource_type(resource_type)
     if safe_type is None:
@@ -2763,7 +2836,8 @@ def get_kubectl_describe(
         return {"ok": False, "error": K8S_NAMESPACE_ERROR}
 
     cmd = f"kubectl describe {safe_type} {shlex.quote(name)} --namespace={shlex.quote(namespace)}"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    result = run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(result, redactor=redact_k8s_describe)
 
 @mcp.tool()
 def get_kubectl_events(
@@ -2785,6 +2859,11 @@ def get_kubectl_events(
     USE THIS TOOL FIRST when you don't know what is wrong in a cluster.
     Events of ALL namespaces are returned unless namespace is given.
     warnings_only=True keeps only events of type Warning (FailedScheduling, BackOff, Unhealthy...).
+    Event messages can hold secrets (the output of a failed probe, an image URL).
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     if namespace is not None and not is_valid_dns_label(namespace):
         return {"ok": False, "error": K8S_NAMESPACE_ERROR}
@@ -2798,7 +2877,8 @@ def get_kubectl_events(
     if warnings_only:
         cmd += " --field-selector=type=Warning"
     cmd = tail_keeping_header(cmd, lines)
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(
+        run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey))
 
 # ---- Kubernetes: crictl (node level) ----
 
@@ -2874,6 +2954,11 @@ def get_crictl_logs(
     Use get_crictl_ps first to find the container ID. Usually requires root.
     Optional since limits them to a time window: '30 min ago', '2 hours ago', '30m', '1h30m'
     or an absolute UTC time 'YYYY-MM-DDTHH:MM:SSZ'.
+    Log lines can hold secrets.
+    Values that look like secrets (passwords, tokens, keys, credentials in URLs) are replaced
+    by '<redacted>' before the output is returned; the "redaction" field of the result says
+    how many. It is pattern-based: a secret in an unusual form may still be shown, and a
+    harmless value that looks like one may be hidden.
     """
     if not is_valid_container_id(container_id):
         return {"ok": False, "error": "Invalid container_id, should be 12 to 64 lowercase hex characters"}
@@ -2888,7 +2973,8 @@ def get_crictl_logs(
         cmd += f" --since={shlex.quote(safe_since)}"
     # crictl replays the container's stderr on stderr; merge to keep the lines in order
     cmd += f" {shlex.quote(container_id)} 2>&1"
-    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+    return redact_secrets_in_result(
+        run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey))
 
 def redact_env_values(obj: Any) -> Any:
     """Returns a copy of parsed JSON with the values of every 'env' / 'envs' entry replaced

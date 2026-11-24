@@ -142,6 +142,18 @@ MARKERS = {
     "ZQM12": ("secret", "fstab cifs user=bob%x,,y (before the doubled comma)"),
     "ZQM13": ("secret", "fstab cifs user=bob%x,,y (after the doubled comma)"),
     "ZQX09": ("control", "fstab cifs domain=x after password=, must stay"),
+    # k8s: a deployment in namespace zqleak, pinned to the control plane node
+    "ZQN01": ("secret", "pod env DB_PASSWORD=x (describe), echoed as password=x (logs)"),
+    "ZQN02": ("secret", "pod env MODE=x: describe hides every literal env value"),
+    "ZQN03": ("secret", "pod env DATABASE_URL=postgres://u:x@db (describe, logs)"),
+    "ZQN04": ("secret", "secret value via secretKeyRef, echoed as api_key=x (logs)"),
+    "ZQN05": ("secret", "pod args --password=x (describe)"),
+    "ZQN06": ("gap", "pod log 'token x' with no ="),
+    "ZQN07": ("secret", "pod env multi-line value, first line (describe)"),
+    "ZQN08": ("secret", "pod env multi-line value, continuation line (describe)"),
+    "ZQN09": ("secret", "pod env with a harmless name (describe)"),
+    "ZQX18": ("control", "pod env variable name, must stay (describe)"),
+    "ZQX19": ("control", "secretKeyRef key name in <set to the key ...>, must stay (describe)"),
     "ZQL11": ("secret", "lockfile requirements.txt --index-url https://user:x@host"),
     "ZQL12": ("secret", "lockfile requirements.txt git+https://x@host (token as user name)"),
     "ZQX16": ("control", "lockfile requirements.txt secretstorage==x, must stay"),
@@ -171,6 +183,7 @@ CONTROLS = {
                ("get_cron_jobs", None): ["ZQX05", "ZQX06"],
                ("get_fstab", None): ["ZQX09"],
                ("get_lockfiles", "include_contents"): ["ZQX16"]},
+    "k8s": {("get_kubectl_describe", None): ["ZQX18", "ZQX19"]},
 }
 # profile -> the calls (tool, daemon or service arg) whose output always holds a planted
 # secret: when one of them replaced nothing, the planting did not land
@@ -184,6 +197,7 @@ MUST_REDACT = {
     "alpine": {("get_crontab_tasks", None), ("get_cron_jobs", None), ("get_ps_aux_top_cpu_consumers", None),
                ("get_top", None), ("get_host_overview", None), ("get_fstab", None),
                ("get_mount_problems", None), ("get_lockfiles", "include_contents")},
+    "k8s": {("get_kubectl_logs", None), ("get_crictl_logs", None), ("get_kubectl_describe", None)},
 }
 # values for required parameters; the leak units and container are the interesting ones
 REQUIRED = {
@@ -200,6 +214,27 @@ EXTRA_CALLS = [
 ]
 
 
+# profile -> tool -> the arguments of its one call, in place of REQUIRED. {pod} and {cid} are
+# looked up on the node when check starts (the pod name has a random suffix).
+PROFILE_ARGS = {
+    "k8s": {
+        "get_kubectl_logs": {"pod": "{pod}", "namespace": "zqleak"},
+        "get_kubectl_describe": {"resource_type": "pod", "name": "{pod}", "namespace": "zqleak"},
+        "get_kubectl_events": {"namespace": "zqleak"},
+        "get_crictl_logs": {"container_id": "{cid}"},
+        "get_crictl_inspect": {"container_id": "{cid}"},
+    },
+}
+PROFILE_EXTRA_CALLS = {
+    "k8s": [("get_kubectl_describe", {"resource_type": "deployment", "name": "leakpod", "namespace": "zqleak"})],
+}
+# what {pod} and {cid} are: read-only lookups, run through the server's own run_ssh_command
+LOOKUPS = {
+    "k8s": {"pod": "kubectl -n zqleak get pod -l app=leakpod -o name | cut -d/ -f2",
+            "cid": "crictl ps --name leak -q | head -n 1"},
+}
+
+
 def call_key(tool, args):
     """(tool, what tells its calls apart) as in CONTROLS and MUST_REDACT: the unit or
     service, or "include_contents" for get_lockfiles printing the files."""
@@ -210,7 +245,7 @@ def call_key(tool, args):
 def parse_target(text):
     profile, _, dest = text.partition("=")
     if profile not in CONTROLS or "@" not in dest:
-        raise argparse.ArgumentTypeError(f"expected debian=USER@HOST[:PORT] or alpine=USER@HOST[:PORT], got {text!r}")
+        raise argparse.ArgumentTypeError(f"expected debian=, alpine= or k8s=USER@HOST[:PORT], got {text!r}")
     user, _, hostport = dest.partition("@")
     host, _, port = hostport.partition(":")
     return {"profile": profile, "user": user, "host": host, "port": int(port or 22)}
@@ -227,18 +262,33 @@ def ssh_script(target, key, script):
     return r.returncode
 
 
-def tool_calls():
+def tool_calls(profile, found):
+    overrides = PROFILE_ARGS.get(profile, {})
+    fill = lambda args: {k: v.format(**found) if isinstance(v, str) else v for k, v in args.items()}
     calls = []
     for tool in asyncio.run(mcp_ssh.mcp.list_tools()):
         fn = getattr(mcp_ssh, tool.name)
         params = mcp_ssh.inspect.signature(fn).parameters
-        calls.append((tool.name, {p: REQUIRED[p] for p in params if p in REQUIRED and params[p].default is params[p].empty}))
-    return calls + EXTRA_CALLS
+        if tool.name in overrides:
+            calls.append((tool.name, fill(overrides[tool.name])))
+        else:
+            calls.append((tool.name, {p: REQUIRED[p] for p in params if p in REQUIRED and params[p].default is params[p].empty}))
+    return calls + EXTRA_CALLS + [(t, fill(a)) for t, a in PROFILE_EXTRA_CALLS.get(profile, [])]
+
+
+def lookup(target, key):
+    found = {}
+    for name, cmd in LOOKUPS.get(target["profile"], {}).items():
+        r = mcp_ssh.run_ssh_command(target["host"], target["user"], cmd, port=target["port"], key_path=key)
+        found[name] = (r.get("data") or {}).get("stdout", "").strip()
+        if not found[name]:
+            sys.exit(f"[{target['profile']}] could not find {name} ({cmd}): did plant run?")
+    return found
 
 
 def check(target, key):
     failures, rows = [], []
-    for tool, args in tool_calls():
+    for tool, args in tool_calls(target["profile"], lookup(target, key)):
         r = getattr(mcp_ssh, tool)(host=target["host"], user=target["user"], port=target["port"], key_path=key, **args)
         shown = sorted(set(MARKER.findall(json.dumps(r))))
         redacts, replaced, checked = "redaction" in r, (r.get("redaction") or {}).get("replaced"), r

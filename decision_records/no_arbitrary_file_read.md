@@ -78,11 +78,14 @@ The program reads its own files; the tool returns what the program prints.
 | `sshd -T` | `sshd_config` and its includes, as the effective config | `get_sshd_effective_config` | - | no |
 | `last`, `lastb` | `/var/log/wtmp`, `/var/log/btmp` | `get_last_logins`, `get_failed_logins` | 50 entries | no |
 | `dmesg` | kernel ring buffer (not a file) | `get_dmesg` | `since` | no |
-| `docker logs`, `crictl logs` | container output | `get_docker_logs`, `get_crictl_logs` | `lines`, `since` | yes |
-| `kubectl logs` | container output | `get_kubectl_logs` | `lines`, `since` | **no** |
-| `docker inspect`, `crictl inspect`, `crictl inspecti` | container / image config | `get_docker_inspect`, `get_crictl_inspect`, `get_crictl_inspect_image` | one object | yes |
-| `kubectl describe` | object spec and status | `get_kubectl_describe` | one object | **no** |
-| `coredumpctl list` | core dump metadata | `get_coredumps` | `lines` | yes |
+| `docker logs` | container output | `get_docker_logs` | `lines`, `since` | yes |
+| `crictl logs` | container output | `get_crictl_logs` | `lines`, `since` | yes |
+| `kubectl logs` | container output | `get_kubectl_logs` | `lines`, `since` | yes |
+| `docker inspect` | container config | `get_docker_inspect` | one object | yes |
+| `crictl inspect`, `crictl inspecti` | container / image config | `get_crictl_inspect`, `get_crictl_inspect_image` | one object | `env` values only (structured); command-line arguments are shown, see [get_crictl_inspect.md](get_crictl_inspect.md) |
+| `kubectl describe` | object spec and status | `get_kubectl_describe` | one object | yes: every literal env value, then `SECRET_PATTERNS` ([get_kubectl_describe_pod.md](get_kubectl_describe_pod.md)) |
+| `kubectl get events` | event messages | `get_kubectl_events` | `lines` | yes |
+| `coredumpctl list` | core dump metadata | `get_coredumps` | `lines` | no |
 | `dpkg-query`, `rpm` | package databases | `get_installed_packages`, `get_libc_version`, `get_process_files` | - | no |
 | `findmnt --verify` | `/etc/fstab` | `get_mount_problems` | - | yes |
 
@@ -106,10 +109,10 @@ package names and versions stay intact: see [redact_lockfiles.md](redact_lockfil
 
 ## Open points
 
-Gaps found while writing this record, not fixed by it:
-
-- `get_kubectl_logs` and `get_kubectl_describe` are not redacted, unlike their docker and
-  crictl counterparts. `kubectl describe pod` shows literal `env` values of the pod spec.
+None. The gaps found while writing this record were closed on 2026-11-24: lockfile
+contents ([redact_lockfiles.md](redact_lockfiles.md)), container logs (`get_crictl_logs`,
+`get_kubectl_logs`) and `kubectl describe` env values
+([get_kubectl_describe_pod.md](get_kubectl_describe_pod.md)).
 
 ## Out of scope
 

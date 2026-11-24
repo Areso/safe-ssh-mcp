@@ -224,6 +224,7 @@ REDACTING_TOOLS = {
     "get_ps_aux_top_cpu_consumers", "get_ps_aux_top_mem_consumers", "get_top",
     "get_docker_logs", "get_docker_inspect", "get_service_logs_from_journalctl", "get_journal_errors",
     "get_fstab", "get_mount_problems",
+    "get_crictl_logs", "get_kubectl_logs", "get_kubectl_events", "get_kubectl_describe",
 }
 REQUIRED_ARGS = {
     "abs_paths": ["/srv"], "daemon": "nginx", "container": "web", "pod": "web-1", "resource_type": "pod",
@@ -430,3 +431,93 @@ def test_lockfile_patterns_redact_query_tokens(text, expected):
 ])
 def test_lockfile_patterns_keep_other_query_parameters(text):
     assert mcp_ssh.redact_secrets(text, mcp_ssh.LOCKFILE_SECRET_PATTERNS) == (text, 0)
+
+
+# ============================================================
+# kubectl describe: every literal env value, then SECRET_PATTERNS
+# ============================================================
+
+DESCRIBE_POD = """Name:             leakpod-596b9b4c4f-vdr9b
+Containers:
+  leak:
+    Command:
+      sh
+      -c
+    Args:
+      echo "start"; exec sleep 99999
+      --password=hunter2
+    State:          Running
+    Environment:
+      DB_PASSWORD:   s3cret
+      MODE:          prod
+      DATABASE_URL:  postgres://app:pw@db:5432/app
+      TLS_KEY:       line one
+                     line two
+      API_TOKEN:     <set to the key 'token' in secret 'db-creds'>  Optional: false
+      APP_CONF:      <set to the key 'conf' of config map 'app'>  Optional: true
+      POD_IP:         (v1:status.podIP)
+      CPU_LIMIT:     node allocatable (limits.cpu)
+    Environment Variables from:
+      app-env     ConfigMap  Optional: false
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-q (ro)
+  sidecar:
+    Environment:  <none>
+    Mounts:         <none>
+Volumes:
+  kube-api-access-q:
+    TokenExpirationSeconds:  3607
+Events:
+  Normal  Started  57s   kubelet  spec.containers{leak}: Container started"""
+
+
+def test_describe_hides_every_literal_env_value():
+    out, n = mcp_ssh.redact_k8s_describe(DESCRIBE_POD)
+    env = out.split("    Environment:\n")[1].split("    Environment Variables from:")[0]
+    assert env == (
+        f"      DB_PASSWORD:   {R}\n"
+        f"      MODE:          {R}\n"
+        f"      DATABASE_URL:  {R}\n"
+        f"      TLS_KEY:       {R}\n"
+        "      API_TOKEN:     <set to the key 'token' in secret 'db-creds'>  Optional: false\n"
+        "      APP_CONF:      <set to the key 'conf' of config map 'app'>  Optional: true\n"
+        "      POD_IP:         (v1:status.podIP)\n"
+        "      CPU_LIMIT:     node allocatable (limits.cpu)\n"
+    )
+    for leaked in ("s3cret", "prod", "pw@", "line one", "line two", "hunter2"):
+        assert leaked not in out
+    # 4 env values (the multi-line one once), --password, TokenExpirationSeconds (general rule)
+    assert n == 6
+
+
+def test_describe_keeps_the_rest_and_applies_the_general_rules():
+    out, _ = mcp_ssh.redact_k8s_describe(DESCRIBE_POD)
+    assert f"      --password={R}\n" in out
+    for kept in ("      echo \"start\"; exec sleep 99999\n", "      app-env     ConfigMap  Optional: false\n",
+                 "    Environment:  <none>\n", "  sidecar:\n", "/var/run/secrets/kubernetes.io/serviceaccount",
+                 "spec.containers{leak}: Container started"):
+        assert kept in out
+    assert out.count("\n") == DESCRIBE_POD.count("\n") - 1  # only the continuation line went
+
+
+def test_describe_redacting_twice_changes_nothing():
+    once, _ = mcp_ssh.redact_k8s_describe(DESCRIBE_POD)
+    assert mcp_ssh.redact_k8s_describe(once) == (once, 0)
+
+
+def test_describe_pod_template_env_block():
+    # deployments, statefulsets, jobs...: the block sits deeper, under "Pod Template:"
+    text = ("Pod Template:\n  Containers:\n   leak:\n    Environment:\n      A:  1\n      B:  2\n"
+            "    Mounts:          <none>\n  Volumes:           <none>")
+    out, n = mcp_ssh.redact_k8s_describe(text)
+    assert out == text.replace("A:  1", f"A:  {R}").replace("B:  2", f"B:  {R}") and n == 2
+
+
+def test_describe_tool_uses_the_describe_redactor(mock_run_ssh_command):
+    mock_run_ssh_command.return_value = {
+        "ok": True, "host": "h", "collected_at_utc": "t",
+        "data": {"command": "c", "exit_code": 0, "stdout": DESCRIBE_POD, "stderr": ""},
+    }
+    result = mcp_ssh.get_kubectl_describe(host="h", user="u", resource_type="pod", name="leakpod")
+    assert result["data"]["stdout"] == mcp_ssh.redact_k8s_describe(DESCRIBE_POD)[0]
+    assert result["redaction"] == {"replaced": 6, "note": mcp_ssh.REDACTION_NOTE}

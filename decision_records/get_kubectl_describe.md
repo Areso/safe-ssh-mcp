@@ -21,5 +21,5 @@ Describing a configmap prints its data.
 
 ## Related
 
-- [get_kubectl_describe_pod.md](get_kubectl_describe_pod.md) — environment values
-  that `kubectl describe pod` still prints.
+- [get_kubectl_describe_pod.md](get_kubectl_describe_pod.md) — how the environment
+  values and command lines that `kubectl describe` prints are redacted.

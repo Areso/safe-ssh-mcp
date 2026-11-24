@@ -1,6 +1,6 @@
 # redact_secrets: values that look like secrets are redacted in free-text output
 
-Date: 2026-11-22, updated 2026-11-23
+Date: 2026-11-22, updated 2026-11-24
 Status: accepted
 
 ## Decision
@@ -16,24 +16,64 @@ a secret with `<redacted>` and adds a `redaction` field to the result:
 The field is there even when nothing was replaced, so the model always knows the output
 was filtered and that the filter is not a guarantee.
 
-Used by 14 tools and four sections of `get_host_overview` (2026-11-24):
+## Which tools redact, with which function and patterns
 
-- cron: `get_crontab_tasks`, `get_cron_jobs`;
-- systemd: `get_systemd_status`, `get_systemd_unit_definition`;
-- processes: `get_ps_aux_top_cpu_consumers`, `get_ps_aux_top_mem_consumers`, `get_top`;
-- journal: `get_service_logs_from_journalctl`, `get_journal_errors`;
-- docker: `get_docker_logs`, `get_docker_inspect`;
-- mounts: `get_fstab`, `get_mount_problems`;
-- lockfiles: `get_lockfiles`, with `include_contents=True` only.
+As of 2026-11-24: 18 tools redact free text, 2 redact structured JSON, and 4 sections of
+`get_host_overview` are redacted as their tools are. Every other tool returns its output
+as it is.
 
-Some outputs have their own syntax and get a rule set of their own, run before the
-general rules: unit files (`SYSTEMD_SECRET_PATTERNS`) and mount options
-(`MOUNT_SECRET_PATTERNS`). Lockfiles get one INSTEAD of the general rules
-(`LOCKFILE_SECRET_PATTERNS`: credentials in URLs, secret query parameters and token
-prefixes only), as the general
-rules break package names such as `secretstorage==3.3.3`; see
-[redact_lockfiles.md](redact_lockfiles.md). Which tool uses which set, and which functions apply them:
-the table in [redact_mount_options.md](redact_mount_options.md#the-redaction-functions-and-where-each-rule-set-is-applied).
+The functions:
+
+- `redact_secrets(text, patterns=SECRET_PATTERNS)`: redacts a string with a rule set;
+  returns the text and the number of values replaced.
+- `redact_secrets_in_result(result, patterns=SECRET_PATTERNS, redactor=None)`: redacts the
+  stdout and stderr of a `run_ssh_command` result with `redact_secrets` and `patterns`, or
+  with `redactor` when given, and adds the `redaction` field.
+- `redact_k8s_describe(text)`: a `redactor` for `kubectl describe`: every literal value in
+  `Environment:` blocks, then `SECRET_PATTERNS` on the other lines.
+- `_redact_env_in_json_stdout(result)` with `redact_env_values`: parses JSON and replaces
+  every `env` / `envs` value, at any depth; output that is not valid JSON is dropped. No
+  `redaction` field.
+
+The rule sets (all in `mcp_ssh.py`):
+
+| Rule set | What it is |
+|---|---|
+| `SECRET_PATTERNS` | the general rules, listed under [Why](#why) below |
+| `SYSTEMD_SECRET_PATTERNS` | `Environment="NAME=a b"` (the quotes wrap the whole assignment), then `SECRET_PATTERNS` |
+| `MOUNT_SECRET_PATTERNS` | comma-separated mount options (`password=`, `pass=`, `user=name%pw`, `credentials=`), then `SECRET_PATTERNS`; see [redact_mount_options.md](redact_mount_options.md) |
+| `LOCKFILE_SECRET_PATTERNS` | credentials in URLs, secret query parameters, token prefixes; INSTEAD of `SECRET_PATTERNS`, which breaks package names (`secretstorage==3.3.3`); see [redact_lockfiles.md](redact_lockfiles.md) |
+
+| Area | Tool | Function | Patterns |
+|---|---|---|---|
+| cron | `get_crontab_tasks` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| cron | `get_cron_jobs` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| systemd | `get_systemd_status` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| systemd | `get_systemd_unit_definition` | `redact_secrets_in_result` | `SYSTEMD_SECRET_PATTERNS` |
+| processes | `get_ps_aux_top_cpu_consumers` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| processes | `get_ps_aux_top_mem_consumers` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| processes | `get_top` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| journal | `get_service_logs_from_journalctl` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| journal | `get_journal_errors` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| docker | `get_docker_logs` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| docker | `get_docker_inspect` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| kubernetes | `get_kubectl_logs` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| kubernetes | `get_kubectl_events` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| kubernetes | `get_kubectl_describe` | `redact_secrets_in_result(redactor=redact_k8s_describe)` | every literal env value, then `SECRET_PATTERNS`; see [get_kubectl_describe_pod.md](get_kubectl_describe_pod.md) |
+| kubernetes | `get_crictl_logs` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
+| kubernetes | `get_crictl_inspect` | `_redact_env_in_json_stdout` | structured: every `env` value; command-line arguments are not redacted, see [get_crictl_inspect.md](get_crictl_inspect.md) |
+| kubernetes | `get_crictl_inspect_image` | `_redact_env_in_json_stdout` | structured: every `env` value; entrypoint and cmd are not redacted |
+| mounts | `get_fstab` | `redact_secrets_in_result` | `MOUNT_SECRET_PATTERNS` |
+| mounts | `get_mount_problems` | `redact_secrets_in_result` | `MOUNT_SECRET_PATTERNS` |
+| lockfiles | `get_lockfiles`, with `include_contents=True` only | `redact_secrets_in_result` | `LOCKFILE_SECRET_PATTERNS` |
+| overview | `get_host_overview`: sections `mount_problems`, `top_cpu_processes`, `top_memory_processes`, `journal_errors` | `redact_secrets_in_result`, per section | the section's tool's set, from `HOST_OVERVIEW_REDACTED_TOOLS`: `MOUNT_SECRET_PATTERNS` for `mount_problems`, `SECRET_PATTERNS` for the others; the other sections are not redacted, as their tools are not |
+| - | every other tool (`get_mounts`, `get_coredumps`, `get_dns_lookup`, ...) | none | |
+
+`tests/test_redact.py::test_exactly_these_tools_redact` fails when a tool starts or stops
+adding a `redaction` field without `REDACTING_TOOLS` being updated (`get_lockfiles`, which
+redacts only with a parameter, and the crictl inspect tools, which add no field, have tests
+of their own), and `tests/test_overview.py` checks that each redacted overview section
+matches its tool's output. Update this table with them.
 
 ## Why
 
@@ -135,7 +175,7 @@ reach neither the model nor the client. The server does not log command output.
   such structure, hence the pattern-based approach here. See
   [get_crictl_inspect.md](get_crictl_inspect.md).
 - [redact_mount_options.md](redact_mount_options.md): why mount options have their own
-  rules, and the table of which tool uses which function and rule set.
+  rules.
 - `get_docker_inspect` redacts its command line since 2026-11-23
   ([get_docker_inspect.md](get_docker_inspect.md)). The crictl inspect tools still leave
   secrets in command-line arguments as a known gap
@@ -145,7 +185,6 @@ reach neither the model nor the client. The server does not log command output.
   why it redacts.
 - [no_arbitrary_file_read.md](no_arbitrary_file_read.md): no tool prints a file the caller
   names, since redaction cannot be trusted on files of unknown format. It lists every tool
-  that does read a file, whether it redacts, and the tools still not redacted
-  (`get_kubectl_logs`, `get_kubectl_describe`).
+  that does read a file and whether it redacts.
 - [redact_lockfiles.md](redact_lockfiles.md): the lockfile rule set, used instead of
   `SECRET_PATTERNS`, not after it.

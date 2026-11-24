@@ -17,7 +17,10 @@ T="--target debian=root@1.2.3.4 --target alpine=alpine@5.6.7.8 --key $HOME/.ssh/
 (In zsh, `$T` is not split into words: write the options out, or use `${=T}`.)
 
 Profiles: `debian` (Debian/Ubuntu, as root; installs `docker.io` unless `SKIP_DOCKER=1`, a few
-minutes on a 512 MB VM) and `alpine` (a non-root user with `doas -n`; no systemd, no docker).
+minutes on a 512 MB VM), `alpine` (a non-root user with `doas -n`; no systemd, no docker) and
+`k8s` (root on a kubeadm control plane with kubectl and crictl: a deployment with secrets in
+its env, args and logs, in namespace `zqleak`, pinned to that node so that crictl sees it;
+check looks up the pod name and container ID itself).
 Exit code 0 means no failure.
 
 ## Markers

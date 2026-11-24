@@ -13,7 +13,7 @@ scripts that cover what changed.
 | anything | `uv run pytest -q` |
 | a tool's command, a builder, a new or removed tool | `.venv/bin/python scripts/ab_test/ab_test.py commands` (offline: every existing tool must send the same command unless the change meant otherwise) |
 | SSH, the remote wrapper, `timeout_wrapped` / `TIMEOUT_SCRIPT`, `_run_cmd` | `scripts/ab_test/ab_test.py fleet` and `timeouts` |
-| redaction (patterns, rule sets, which tools redact) | `scripts/redaction_test/redaction_test.py plant` then `check` |
+| redaction (patterns, rule sets, which tools redact) | `scripts/redaction_test/redaction_test.py plant` then `check`, and `scripts/ab_test/ab_test.py fleet` (on output nobody planted, the only differences must be values that became `<redacted>`: check each one is a secret or an accepted over-redaction) |
 
 - When a fix adds a new case, add it to the live script too (a marker in
   `scripts/redaction_test/`, a scenario in `scripts/ab_test/`), not only to the unit tests.
@@ -23,8 +23,13 @@ scripts that cover what changed.
   from the VMs that are up now: `doctl list` (a shell alias; where aliases are not loaded,
   run `python3 ../do_handler/digitalocean_vms.py list`). One line per VM, `NAME USER@PUBLIC_IP`, with the image's distro
   as NAME (`ubuntu`, `debian`, `fedora`, `centos`, `alpine`, ...); USER is `alpine` on Alpine
-  images and `root` on the others. Take the `--target`s of `scripts/redaction_test/` from
-  the same list (`debian=` for Debian/Ubuntu, `alpine=` for Alpine).
+  images and `root` on the others. When a kubeadm test cluster is up, add its control plane
+  as `ubuntu-k8s root@PUBLIC_IP` (NAME must be unique), so that the kubectl and crictl tools
+  run against a real cluster. `fleet` calls them with placeholder names (`pod: web-1`), so
+  after a change to how they redact, also compare HEAD and the working tree on real objects
+  (a pod, its container, a deployment). Take the `--target`s of `scripts/redaction_test/` from
+  the same list (`debian=` for Debian/Ubuntu, `alpine=` for Alpine, `k8s=` for the control
+  plane of a kubeadm test cluster).
 - Report which suites ran and their results (passed / failed counts, failures by name).
 
 ## No token-shaped strings in the repo

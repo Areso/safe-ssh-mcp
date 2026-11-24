@@ -62,33 +62,8 @@ with `MOUNT_SECRET_PATTERNS`.
 
 ## The redaction functions and where each rule set is applied
 
-There are four free-text rule sets, all applied by the same two functions, and one
-structured redaction:
-
-- `redact_secrets(text, patterns=SECRET_PATTERNS)`: redacts a string, returns it and the
-  number of values replaced.
-- `redact_secrets_in_result(result, patterns=SECRET_PATTERNS)`: applies `redact_secrets`
-  to the stdout and stderr of a `run_ssh_command` result and adds the `redaction` field.
-- `redact_env_values` / `_redact_env_in_json_stdout`: parse JSON and blank every `env`
-  value (crictl). See [get_crictl_inspect.md](get_crictl_inspect.md).
-
-| Tool | Function | Rule set |
-|---|---|---|
-| `get_crontab_tasks`, `get_cron_jobs` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
-| `get_systemd_status` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
-| `get_ps_aux_top_cpu_consumers`, `get_ps_aux_top_mem_consumers`, `get_top` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
-| `get_service_logs_from_journalctl`, `get_journal_errors` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
-| `get_docker_logs`, `get_docker_inspect` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
-| `get_systemd_unit_definition` | `redact_secrets_in_result` | `SYSTEMD_SECRET_PATTERNS`: a rule for `Environment="NAME=a b"`, where the quotes wrap the whole assignment, then `SECRET_PATTERNS` |
-| `get_fstab`, `get_mount_problems` | `redact_secrets_in_result` | `MOUNT_SECRET_PATTERNS`: the mount rules above, then `SECRET_PATTERNS` |
-| `get_lockfiles` with `include_contents=True` | `redact_secrets_in_result` | `LOCKFILE_SECRET_PATTERNS`: credentials in URLs, secret query parameters and token prefixes, without `SECRET_PATTERNS` ([redact_lockfiles.md](redact_lockfiles.md)) |
-| `get_host_overview` | `redact_secrets_in_result`, per section | the section's tool's set, from `HOST_OVERVIEW_REDACTED_TOOLS`: `mount_problems` with `MOUNT_SECRET_PATTERNS`; `top_cpu_processes`, `top_memory_processes`, `journal_errors` with `SECRET_PATTERNS`; the other sections are not redacted, as their tools are not |
-| `get_crictl_inspect`, `get_crictl_inspect_image` | `_redact_env_in_json_stdout` | structured: every `env` / `envs` value |
-| every other tool, `get_mounts` included | none | |
-
-`tests/test_redact.py::test_exactly_these_tools_redact` fails when a tool starts or stops
-redacting without this list being updated, and `tests/test_overview.py` checks that each
-redacted overview section matches its tool's output.
+Moved on 2026-11-24 to [redact_secrets.md](redact_secrets.md#which-tools-redact-with-which-function-and-patterns):
+one table of every tool with its redaction function and rule set.
 
 ## Tested
 
