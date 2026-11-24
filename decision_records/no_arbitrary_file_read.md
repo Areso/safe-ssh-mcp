@@ -99,8 +99,9 @@ The only tool that prints files under paths the caller gives. It is bounded by t
 
 Accepted because dependency versions are what a vulnerability check needs, and lockfiles
 are generated files that seldom hold secrets. Since 2026-11-24 the contents are redacted
-with a rule set of their own, credentials in URLs and token prefixes only
-(`--index-url https://user:<redacted>@host`, `git+https://<redacted>@host`), so that
+with a rule set of their own, credentials in URLs, secret query parameters and token
+prefixes only (`--index-url https://user:<redacted>@host`, `git+https://<redacted>@host`,
+`?private_token=<redacted>`), so that
 package names and versions stay intact: see [redact_lockfiles.md](redact_lockfiles.md).
 
 ## Open points
@@ -109,6 +110,9 @@ Gaps found while writing this record, not fixed by it:
 
 - `get_kubectl_logs` and `get_kubectl_describe` are not redacted, unlike their docker and
   crictl counterparts. `kubectl describe pod` shows literal `env` values of the pod spec.
+
+## Out of scope
+
 - `get_failed_logins` (`lastb`) shows the user names of failed logins, and people
   sometimes type a password into the user name prompt.
 

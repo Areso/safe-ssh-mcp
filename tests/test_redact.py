@@ -392,3 +392,41 @@ def test_lockfiles_with_contents_use_the_lockfile_patterns(mock_run_ssh_command)
 def test_lockfiles_listing_is_not_redacted(mock_run_ssh_command):
     # without include_contents the output is `ls -l` of the files found: names, no contents
     assert "redaction" not in mcp_ssh.get_lockfiles(host="h", user="u", abs_paths=["/srv/app"])
+
+
+@pytest.mark.parametrize("text, expected", [
+    # GitLab tokens as query parameters, in lockfile URLs
+    ("pkg @ https://files.example.com/pkg-1.0.whl?token=abc123",
+     f"pkg @ https://files.example.com/pkg-1.0.whl?token={R}"),
+    ('"resolved": "https://gitlab.example.com/api/v4/projects/42/packages/generic/lib/1.0/lib.tgz?private_token=abc",',
+     f'"resolved": "https://gitlab.example.com/api/v4/projects/42/packages/generic/lib/1.0/lib.tgz?private_token={R}",'),
+    ("tarball: https://gitlab.example.com/x.tgz?job_token=abc&ref=main",
+     f"tarball: https://gitlab.example.com/x.tgz?job_token={R}&ref=main"),
+    # old GitHub API
+    ('"url": "https://api.github.com/repos/o/r/zipball/v1?access_token=abc"',
+     f'"url": "https://api.github.com/repos/o/r/zipball/v1?access_token={R}"'),
+    # signed URLs: Azure SAS, S3 (every parameter, not only the first), GCS
+    ("https://a.blob.core.windows.net/c/p.tgz?sv=2022-11-02&se=2026-12-01&sr=b&sp=r&sig=abc%2Bdef",
+     f"https://a.blob.core.windows.net/c/p.tgz?sv=2022-11-02&se=2026-12-01&sr=b&sp=r&sig={R}"),
+    ("https://b.s3.amazonaws.com/p.whl?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token=abc&X-Amz-Signature=def",
+     f"https://b.s3.amazonaws.com/p.whl?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token={R}&X-Amz-Signature={R}"),
+    ("https://storage.googleapis.com/b/p.tgz?X-Goog-Signature=abc", f"https://storage.googleapis.com/b/p.tgz?X-Goog-Signature={R}"),
+    # the value ends at the fragment
+    ("https://host/p.tgz?auth=abc#sha512-xyz", f"https://host/p.tgz?auth={R}#sha512-xyz"),
+    ("https://host/p.tgz?apikey=abc", f"https://host/p.tgz?apikey={R}"),
+])
+def test_lockfile_patterns_redact_query_tokens(text, expected):
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.LOCKFILE_SECRET_PATTERNS)[0] == expected
+
+
+@pytest.mark.parametrize("text", [
+    "https://host/p.tgz?token=${NPM_TOKEN}",
+    'source = "git+https://github.com/org/lib?branch=token-fix#abc"',
+    'source = "git+https://github.com/org/lib?rev=abc123#abc"',
+    "git+https://github.com/org/lib.git?tag=v1.2",
+    '"resolved": "https://registry.npmjs.org/x/-/x-1.0.0.tgz#sha512-AbC=="',
+    "https://host/search?q=token&sort=asc",
+    "https://host/p?author=x&tag=v1",
+])
+def test_lockfile_patterns_keep_other_query_parameters(text):
+    assert mcp_ssh.redact_secrets(text, mcp_ssh.LOCKFILE_SECRET_PATTERNS) == (text, 0)

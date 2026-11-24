@@ -152,10 +152,13 @@ MARKERS = {
     "ZQL04": ("secret", "lockfile requirements.txt name @ https://x@host/pkg.whl"),
     "ZQL05": ("secret", "lockfile requirements.txt git+https://ghp_x@github.com"),
     "ZQL06": ("secret", "lockfile package-lock.json resolved https://user:x@registry"),
+    "ZQL07": ("secret", "lockfile package-lock.json resolved ...tgz?private_token=x"),
+    "ZQL08": ("secret", "lockfile requirements.txt name @ https://host/pkg.whl?token=x"),
     "ZQX12": ("control", "lockfile requirements.txt secretstorage==x, must stay"),
     "ZQX13": ("control", "lockfile requirements.txt ${x} placeholder in an index URL, must stay"),
     "ZQX14": ("control", "lockfile requirements.txt git+ssh://x@host user name, must stay"),
     "ZQX15": ("control", 'lockfile package-lock.json "js-tokens": "x" version, must stay'),
+    "ZQX17": ("control", "lockfile requirements.txt git+https://host/repo?branch=x, must stay"),
 }
 # profile -> (tool, args) -> controls that tool must show
 CONTROLS = {
@@ -163,7 +166,7 @@ CONTROLS = {
                ("get_crontab_tasks", None): ["ZQX11"],
                ("get_cron_jobs", None): ["ZQX03", "ZQX04", "ZQX11"],
                ("get_fstab", None): ["ZQX07", "ZQX08", "ZQX10"],
-               ("get_lockfiles", "include_contents"): ["ZQX12", "ZQX13", "ZQX14", "ZQX15"]},
+               ("get_lockfiles", "include_contents"): ["ZQX12", "ZQX13", "ZQX14", "ZQX15", "ZQX17"]},
     "alpine": {("get_crontab_tasks", None): ["ZQX05", "ZQX06"],
                ("get_cron_jobs", None): ["ZQX05", "ZQX06"],
                ("get_fstab", None): ["ZQX09"],

@@ -81,7 +81,7 @@ structured redaction:
 | `get_docker_logs`, `get_docker_inspect` | `redact_secrets_in_result` | `SECRET_PATTERNS` |
 | `get_systemd_unit_definition` | `redact_secrets_in_result` | `SYSTEMD_SECRET_PATTERNS`: a rule for `Environment="NAME=a b"`, where the quotes wrap the whole assignment, then `SECRET_PATTERNS` |
 | `get_fstab`, `get_mount_problems` | `redact_secrets_in_result` | `MOUNT_SECRET_PATTERNS`: the mount rules above, then `SECRET_PATTERNS` |
-| `get_lockfiles` with `include_contents=True` | `redact_secrets_in_result` | `LOCKFILE_SECRET_PATTERNS`: credentials in URLs and token prefixes, without `SECRET_PATTERNS` ([redact_lockfiles.md](redact_lockfiles.md)) |
+| `get_lockfiles` with `include_contents=True` | `redact_secrets_in_result` | `LOCKFILE_SECRET_PATTERNS`: credentials in URLs, secret query parameters and token prefixes, without `SECRET_PATTERNS` ([redact_lockfiles.md](redact_lockfiles.md)) |
 | `get_host_overview` | `redact_secrets_in_result`, per section | the section's tool's set, from `HOST_OVERVIEW_REDACTED_TOOLS`: `mount_problems` with `MOUNT_SECRET_PATTERNS`; `top_cpu_processes`, `top_memory_processes`, `journal_errors` with `SECRET_PATTERNS`; the other sections are not redacted, as their tools are not |
 | `get_crictl_inspect`, `get_crictl_inspect_image` | `_redact_env_in_json_stdout` | structured: every `env` / `envs` value |
 | every other tool, `get_mounts` included | none | |

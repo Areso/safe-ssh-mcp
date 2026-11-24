@@ -29,7 +29,8 @@ Used by 14 tools and four sections of `get_host_overview` (2026-11-24):
 Some outputs have their own syntax and get a rule set of their own, run before the
 general rules: unit files (`SYSTEMD_SECRET_PATTERNS`) and mount options
 (`MOUNT_SECRET_PATTERNS`). Lockfiles get one INSTEAD of the general rules
-(`LOCKFILE_SECRET_PATTERNS`: credentials in URLs and token prefixes only), as the general
+(`LOCKFILE_SECRET_PATTERNS`: credentials in URLs, secret query parameters and token
+prefixes only), as the general
 rules break package names such as `secretstorage==3.3.3`; see
 [redact_lockfiles.md](redact_lockfiles.md). Which tool uses which set, and which functions apply them:
 the table in [redact_mount_options.md](redact_mount_options.md#the-redaction-functions-and-where-each-rule-set-is-applied).

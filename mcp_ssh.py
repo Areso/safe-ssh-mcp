@@ -1071,8 +1071,8 @@ MOUNT_SECRET_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in 
 # Lockfiles (get_lockfiles with include_contents) are read by programs, and the general rules
 # would corrupt them: secretstorage==3.3.3, tokenizers==0.15.0 and "js-tokens": { look like a
 # secret name with a value. So they get only rules for credentials in URLs, where a
-# requirements*.txt keeps them (--index-url https://user:token@host, git+https://token@host),
-# and the token prefixes. A ${VAR} placeholder, filled in by pip from the environment, is not
+# requirements*.txt keeps them (--index-url https://user:token@host, git+https://token@host,
+# ...whl?private_token=x), and the token prefixes. A ${VAR} placeholder, filled in by pip from the environment, is not
 # a secret and stays visible. See decision_records/redact_lockfiles.md.
 _URL_PLACEHOLDER = r"\$\{[A-Za-z0-9_]+\}(?=@)"
 LOCKFILE_SECRET_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
@@ -1081,6 +1081,11 @@ LOCKFILE_SECRET_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern 
     # http(s)://token@host, git+https://token@host: there a user name alone is a token
     # (in ssh://git@host it is a plain user name, and stays)
     rf"(?P<k>\b(?:[a-z][a-z0-9.-]*\+)?https?://)(?P<v>(?!<redacted>)(?!{_URL_PLACEHOLDER})[^\s/:@'\"]+)(?=@)",
+    # a token as a query parameter of a URL: ?private_token=x, &X-Amz-Signature=x, &sig=x (Azure
+    # SAS). Only the value; ?branch=, ?rev=, ?tag= and #integrity stay. Lockfiles have ? and &
+    # only in URLs, and a package line never has one before a name (tokenizers==0.15.0 stays).
+    rf"(?P<k>[?&](?:[A-Za-z0-9_.-]*{_SECRET_WORDS}[A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*signature|sig|auth)=)"
+    rf"(?P<v>(?!<redacted>)(?!\$\{{)[^&#\s'\"]+)",
 )) + (re.compile(_TOKEN_PREFIX_RULE),)
 REDACTION_NOTE = (
     f"Values that look like secrets (passwords, tokens, keys, credentials in URLs) were replaced "
@@ -1318,7 +1323,7 @@ def get_lockfiles(
     The output can be several MB - call without include_contents first to see the sizes,
     then narrow abs_paths to the application you need.
     With include_contents=True, credentials in URLs (--index-url https://user:<redacted>@host,
-    git+https://<redacted>@host) and known token prefixes are replaced by '<redacted>', and
+    git+https://<redacted>@host, ?private_token=<redacted>, &sig=<redacted>) and known token prefixes are replaced by '<redacted>', and
     redaction.replaced says how many; the sizes in the '=====' lines are those of the files
     on disk. Only these forms are caught, so that package names and versions stay intact:
     a secret written another way is still shown. ${VAR} placeholders stay visible.

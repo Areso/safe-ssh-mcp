@@ -119,11 +119,15 @@ git+https://@GHP@ZQL05bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@github.com/org/lib2.git
 secretstorage==ZQX12
 -i https://deploy:${ZQX13}@nexus.example.com/simple
 git+ssh://ZQX14@git.example.com/org/repo.git
+otherlib @ https://files.example.com/otherlib-1.0-py3-none-any.whl?token=ZQL08
+git+https://git.example.com/org/lib3.git?branch=ZQX17
 REQ
 cat > /srv/zqleak/package-lock.json <<'JSON'
 {"packages": {"node_modules/js-tokens": {"version": "4.0.0",
   "resolved": "https://npm:ZQL06@registry.example.com/js-tokens/-/js-tokens-4.0.0.tgz"},
-  "node_modules/loose-envify": {"requires": {"js-tokens": "ZQX15"}}}}
+  "node_modules/loose-envify": {"requires": {"js-tokens": "ZQX15"}},
+  "node_modules/privlib": {"version": "1.0.0",
+  "resolved": "https://gitlab.example.com/api/v4/projects/42/packages/npm/privlib/-/privlib-1.0.0.tgz?private_token=ZQL07"}}}
 JSON
 fill_tokens /srv/zqleak/requirements.txt
 
