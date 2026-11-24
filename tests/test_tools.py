@@ -387,7 +387,7 @@ def test_sampling_tools_send_command(tool, builder, mock_run_ssh_command):
     ({"interval": 0}, "interval"),
     ({"interval": 11}, "interval"),
     ({"interval": 1.5}, "interval"),
-    ({"samples": 10, "interval": 2}, "set timeout to at least 25"),
+    ({"samples": 30, "interval": 2}, "set timeout to at least 65"),
 ])
 def test_sampling_tools_invalid_args_rejected(tool, kwargs, expected, mock_run_ssh_command):
     result = tool(host="h", user="u", **kwargs)

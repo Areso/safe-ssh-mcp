@@ -69,7 +69,7 @@ stdin to the command (a background job gets `/dev/null`).
 - No connection at the first section: that error is returned as it is. Connection lost
   later: the overview stops, returns the sections collected so far, and says which
   section it stopped at.
-- `timeout` (1-120 s), when given, replaces every section's default limit (10-20 s).
+- `timeout` (1-360 s, the bounds every tool has), when given, replaces every section's default limit (60 s).
 
 ## Name
 

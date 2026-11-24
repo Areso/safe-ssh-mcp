@@ -49,7 +49,9 @@ VARIANTS = {
     "get_mpstat": [{"samples": 1, "interval": 2}],
     "get_cpu_info": [{"include_flags": True}],
 }
-# (name, command, timeout_s, expect_timeout); {n} is a sleep length unique to the run
+# (name, command, timeout_s, expect_timeout); {n} is a sleep length unique to the run.
+# expect_timeout "rejected": the timeout is out of bounds, so nothing may run on the host
+# (with timeout 0, GNU timeout would not stop the command at all).
 SCENARIOS = [
     ("simple", "sleep {n}", 3, True),
     ("pipeline", "sleep {n} | cat", 3, True),
@@ -60,6 +62,8 @@ SCENARIOS = [
     ("pipefail (bash) or not", "set -o pipefail 2>/dev/null; false | true; echo rc=$?", 10, False),
     ("8 MB stdout", "head -c 8000000 /dev/zero | tr '\\0' x", 20, False),
     ("finishes just in time", "sleep 1; echo done", 3, False),
+    ("timeout 0 rejected", "sleep {n}", 0, "rejected"),
+    ("timeout 361 rejected", "sleep {n}", 361, "rejected"),
 ]
 
 
@@ -156,8 +160,10 @@ def worker_timeouts(module_dir, host, user, port, key):
             "timed_out": d.get("timed_out", False), "stdout": d.get("stdout", "")[:30],
             "stdout_len": len(d.get("stdout", "")), "stderr": d.get("stderr", "")[:30],
             "error": error[:80], "leftovers": leftovers,
-            "pass": d.get("timed_out", False) == expect and not leftovers
-                    and "Network error" not in error and seconds < timeout_s + 4,
+            "pass": (error.startswith("Invalid timeout") and seconds < 1 and not leftovers
+                     if expect == "rejected" else
+                     d.get("timed_out", False) == expect and not leftovers
+                     and "Network error" not in error and seconds < timeout_s + 4),
         })
     return rows
 

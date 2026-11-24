@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
+## Unreleased - 2026-XX-XX
+### Changed
+- paramiko and bash wrappers are now enforcing timeouts between 1 and 360 seconds
 
 ## 0.3.1 - 2026-11-23
 ### Added

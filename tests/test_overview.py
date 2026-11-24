@@ -45,7 +45,7 @@ def test_each_section_uses_its_tools_default_timeout(mock_run_ssh_command):
     mcp_ssh.get_host_overview(host="h", user="u")
     expected = [inspect.signature(getattr(mcp_ssh, tool)).parameters["timeout"].default for _, tool, _ in SECTIONS]
     assert [c.args[6] for c in mock_run_ssh_command.call_args_list] == expected
-    assert {10, 20} <= set(expected)  # get_disk_free and get_inode_usage use 10
+    assert set(expected) == {mcp_ssh.TIMEOUT_DEFAULT_S}
 
 
 # ============================================================
@@ -115,14 +115,14 @@ def test_connection_lost_midway_stops_with_what_was_collected(mock_run_ssh_comma
     assert mock_run_ssh_command.call_count == 3
 
 
-@pytest.mark.parametrize("timeout", [0, -1, 121, "20", 2.5, True])
+@pytest.mark.parametrize("timeout", [0, -1, 361, "20", 2.5, True])
 def test_invalid_timeout(timeout, mock_run_ssh_command):
     assert mcp_ssh.get_host_overview(host="h", user="u", timeout=timeout) == {
         "ok": False, "error": mcp_ssh.HOST_OVERVIEW_TIMEOUT_ERROR}
     mock_run_ssh_command.assert_not_called()
 
 
-@pytest.mark.parametrize("timeout", [1, 120])
+@pytest.mark.parametrize("timeout", [1, 360])
 def test_timeout_bounds(timeout, mock_run_ssh_command):
     assert mcp_ssh.get_host_overview(host="h", user="u", timeout=timeout)["ok"] is True
 

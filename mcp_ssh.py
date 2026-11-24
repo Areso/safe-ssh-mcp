@@ -205,6 +205,18 @@ def get_ssh_auth_options(key_path: Optional[str]) -> Dict[str, Any]:
     )
 
 
+# The `timeout` every tool takes, in seconds: it comes from the caller (an LLM), so it is
+# checked; 0 would mean no limit at all to GNU timeout.
+TIMEOUT_DEFAULT_S = 60
+TIMEOUT_MIN_S = 1
+TIMEOUT_MAX_S = 360
+TIMEOUT_ERROR = f"Invalid timeout: an integer from {TIMEOUT_MIN_S} to {TIMEOUT_MAX_S} (seconds)"
+
+def is_valid_timeout(timeout: Any) -> bool:
+    return (isinstance(timeout, int) and not isinstance(timeout, bool)
+            and TIMEOUT_MIN_S <= timeout <= TIMEOUT_MAX_S)
+
+
 def connect_ssh_client(
     client: paramiko.SSHClient,
     host: str,
@@ -284,7 +296,7 @@ def ssh_session(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> ContextManager[paramiko.SSHClient]:
     client = paramiko.SSHClient()
@@ -305,7 +317,7 @@ def get_ssh_client(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> paramiko.SSHClient:
     """Retrieves an active SSH client from the pool or creates a new one."""
@@ -464,12 +476,14 @@ def run_ssh_command(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout_s: int = 20,
+    timeout_s: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
     success_exit_codes: tuple = (0,)
 ) -> Dict[str, Any]:
     """Helper to run an SSH command and capture generalized return payload/errors."""
     collected_at = datetime.now(timezone.utc).isoformat()
+    if not is_valid_timeout(timeout_s):
+        return {"ok": False, "error": TIMEOUT_ERROR}
     
     # 1. Expand the path and validate it BEFORE attempting to connect
     if key_path:
@@ -1095,7 +1109,7 @@ def get_disk_free(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1112,7 +1126,7 @@ def get_inode_usage(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 10,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1128,7 +1142,7 @@ def get_disk_usage(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1165,7 +1179,7 @@ def get_list_of_files(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1207,7 +1221,7 @@ def get_list_of_files_with_filter(
     password: Optional[str] = None,
     key_path: Optional[str] = None,
     filter: str = "",
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1273,7 +1287,7 @@ def get_lockfiles(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 30,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1352,7 +1366,7 @@ def get_is_installed(
     password: Optional[str] = None,
     key_path: Optional[str] = None,
     binary: str = "ls",
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1417,7 +1431,7 @@ def get_installed_packages(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1460,7 +1474,7 @@ def get_dmesg(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
     since: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1489,7 +1503,7 @@ def get_uptime(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1504,7 +1518,7 @@ def get_current_datetime(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1532,7 +1546,7 @@ def get_hostname(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1552,7 +1566,7 @@ def get_distroname_version(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1569,7 +1583,7 @@ def get_kernel_version(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1605,7 +1619,7 @@ def get_libc_version(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1624,7 +1638,7 @@ def get_sshd_effective_config(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1644,7 +1658,7 @@ def get_php_info(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1697,7 +1711,7 @@ def get_systemd_list_all(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1715,7 +1729,7 @@ def get_systemd_list_failed(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1732,7 +1746,7 @@ def get_systemd_list_timers(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1749,7 +1763,7 @@ def get_systemd_status(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1784,7 +1798,7 @@ def get_systemd_unit_definition(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1841,7 +1855,7 @@ def get_ps_aux_top_cpu_consumers(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1866,7 +1880,7 @@ def get_ps_aux_top_mem_consumers(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1893,7 +1907,7 @@ def get_free_memory(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1909,7 +1923,7 @@ def get_mounts(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1929,7 +1943,7 @@ def get_fstab(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2058,7 +2072,7 @@ def get_mount_problems(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2101,7 +2115,7 @@ def get_pressure(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2127,7 +2141,7 @@ def get_vmstat(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2260,7 +2274,7 @@ def get_iostat(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2337,7 +2351,7 @@ def get_mpstat(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2375,7 +2389,7 @@ def get_top(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2449,7 +2463,7 @@ def get_cpu_info(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2477,7 +2491,7 @@ def get_lsblk(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2493,7 +2507,7 @@ def get_docker_ps_all(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2511,7 +2525,7 @@ def get_docker_images(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2533,7 +2547,7 @@ def get_docker_logs(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2573,7 +2587,7 @@ def get_docker_stats(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2612,7 +2626,7 @@ def get_docker_inspect(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2653,7 +2667,7 @@ def get_kubectl_logs(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2700,7 +2714,7 @@ def get_kubectl_describe(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2734,7 +2748,7 @@ def get_kubectl_events(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2768,7 +2782,7 @@ def get_crictl_ps(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2786,7 +2800,7 @@ def get_crictl_images(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2803,7 +2817,7 @@ def get_crictl_imagefsinfo(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2824,7 +2838,7 @@ def get_crictl_logs(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2896,7 +2910,7 @@ def get_crictl_inspect(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2920,7 +2934,7 @@ def get_crictl_inspect_image(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2988,7 +3002,7 @@ def get_crontab_tasks(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3069,7 +3083,7 @@ def get_cron_jobs(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3115,7 +3129,7 @@ def get_listening_sockets(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3183,7 +3197,7 @@ def get_process_files(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3215,7 +3229,7 @@ def get_ip_addr(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3232,7 +3246,7 @@ def get_ip_route(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3254,7 +3268,7 @@ def get_dns_lookup(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3320,7 +3334,7 @@ def check_tcp_connect(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3359,7 +3373,7 @@ def get_service_logs_from_journalctl(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
     since: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -3411,7 +3425,7 @@ def get_journal_errors(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
     since: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -3459,7 +3473,7 @@ def get_journalctl_disk_usage(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3527,7 +3541,7 @@ def get_last_logins(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3553,7 +3567,7 @@ def get_failed_logins(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3579,7 +3593,7 @@ def get_coredumps(
     port: int = 22,
     password: Optional[str] = None,
     key_path: Optional[str] = None,
-    timeout: int = 20,
+    timeout: int = TIMEOUT_DEFAULT_S,
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -3646,12 +3660,10 @@ HOST_OVERVIEW_REDACTED_TOOLS = {
     "get_ps_aux_top_mem_consumers": SECRET_PATTERNS,
     "get_journal_errors": SECRET_PATTERNS,
 }
-HOST_OVERVIEW_TIMEOUT_MAX_S = 120
-
 def tool_default_timeout(tool: str) -> int:
     """The default `timeout` of a tool, so that a section is run as that tool would run it."""
     return inspect.signature(globals()[tool]).parameters["timeout"].default
-HOST_OVERVIEW_TIMEOUT_ERROR = f"Invalid timeout: an integer from 1 to {HOST_OVERVIEW_TIMEOUT_MAX_S} (seconds per section)"
+HOST_OVERVIEW_TIMEOUT_ERROR = TIMEOUT_ERROR + " per section"
 
 @mcp.tool()
 def get_host_overview(
@@ -3688,13 +3700,12 @@ def get_host_overview(
     A section that does not apply to the host fails on its own (e.g. failed_units and
     journal_errors without systemd: exit code 127) and the others still run; ok is True
     when the host was reachable for every section, whatever the sections returned.
-    timeout (seconds, 1-120), when given, is the limit for EACH section instead of its
-    tool's default (10-20 s). The sections run one after another over one SSH
+    timeout (seconds, 1-360), when given, is the limit for EACH section instead of its
+    tool's default (60 s). The sections run one after another over one SSH
     connection: usually a few seconds in all.
     The output is not shortened: about 10-20 KB on a typical server.
     """
-    if timeout is not None and (not isinstance(timeout, int) or isinstance(timeout, bool)
-                                or not 1 <= timeout <= HOST_OVERVIEW_TIMEOUT_MAX_S):
+    if timeout is not None and not is_valid_timeout(timeout):
         return {"ok": False, "error": HOST_OVERVIEW_TIMEOUT_ERROR}
     collected_at = datetime.now(timezone.utc).isoformat()
     sections: Dict[str, Any] = {}

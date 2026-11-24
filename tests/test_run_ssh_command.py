@@ -1,4 +1,5 @@
 """Tests for run_ssh_command orchestration and error handling."""
+import inspect
 import socket
 from datetime import datetime, timezone
 
@@ -126,6 +127,30 @@ class TestRunCmdReading:
     def test_a_timeout_while_connecting_is_still_a_network_error(self, mocker):
         mocker.patch("mcp_ssh.get_ssh_client", side_effect=socket.timeout("timed out"))
         assert mcp_ssh.run_ssh_command("h", "u", "cmd")["error"].startswith("Network error")
+
+
+class TestRunSshCommandTimeoutBounds:
+
+    @pytest.mark.parametrize("timeout", [0, -1, 361, "20", 2.5, True, None])
+    def test_invalid_timeout_rejected_before_connecting(self, timeout, mocker):
+        get_client = mocker.patch("mcp_ssh.get_ssh_client")
+        assert mcp_ssh.run_ssh_command("h", "u", "cmd", timeout_s=timeout) == {
+            "ok": False, "error": mcp_ssh.TIMEOUT_ERROR}
+        get_client.assert_not_called()
+
+    @pytest.mark.parametrize("timeout", [1, 360])
+    def test_bounds_are_allowed(self, timeout, mock_ssh_client):
+        assert mcp_ssh.run_ssh_command("h", "u", "cmd", timeout_s=timeout)["ok"] is True
+
+    def test_every_tool_defaults_to_60s(self):
+        tools = [f for f in vars(mcp_ssh).values() if callable(f) and getattr(f, "__module__", None) == "mcp_ssh"
+                 and "timeout" in inspect.signature(f).parameters and "host" in inspect.signature(f).parameters]
+        assert len(tools) > 50
+        defaults = {f.__name__: inspect.signature(f).parameters["timeout"].default for f in tools}
+        assert {n: d for n, d in defaults.items()
+                if d not in (mcp_ssh.TIMEOUT_DEFAULT_S, inspect.Parameter.empty)} == {
+            "get_host_overview": None}  # None: each section's tool default
+        assert mcp_ssh.TIMEOUT_DEFAULT_S == 60
 
 
 class TestRunSshCommandKeyPath:

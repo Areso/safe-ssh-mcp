@@ -8,7 +8,7 @@ import pytest
 import mcp_ssh
 
 
-def make_pool_key(host, user, port, password=None, key_path=None, timeout=10, accept_new_hostkey=False):
+def make_pool_key(host, user, port, password=None, key_path=None, timeout=mcp_ssh.TIMEOUT_DEFAULT_S, accept_new_hostkey=False):
     """Build the same pool_key used by get_ssh_client."""
     conn_str = f"{host}:{port}:{user}:{password}:{key_path}:{timeout}:{accept_new_hostkey}"
     conn_hash = hashlib.sha256(conn_str.encode()).hexdigest()[:16]
@@ -48,9 +48,9 @@ class TestGetSshClient:
             "port": 22,
             "username": "user1",
             "password": "account-password",
-            "timeout": 10,
-            "banner_timeout": 10,
-            "auth_timeout": 10,
+            "timeout": mcp_ssh.TIMEOUT_DEFAULT_S,
+            "banner_timeout": mcp_ssh.TIMEOUT_DEFAULT_S,
+            "auth_timeout": mcp_ssh.TIMEOUT_DEFAULT_S,
             "key_filename": "/tmp/id_ed25519",
             "passphrase": "key-passphrase",
             "allow_agent": False,
@@ -73,9 +73,9 @@ class TestGetSshClient:
             "port": 22,
             "username": "user1",
             "password": None,
-            "timeout": 10,
-            "banner_timeout": 10,
-            "auth_timeout": 10,
+            "timeout": mcp_ssh.TIMEOUT_DEFAULT_S,
+            "banner_timeout": mcp_ssh.TIMEOUT_DEFAULT_S,
+            "auth_timeout": mcp_ssh.TIMEOUT_DEFAULT_S,
             "key_filename": None,
             "passphrase": None,
             "allow_agent": True,
