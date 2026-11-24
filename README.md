@@ -155,7 +155,7 @@ so restrict access to the process and avoid putting it in source control.
 
 ## Compatibility
 Tested manually on Python3.11 running on MacOS against remote Ubuntu server  
-Autotested with Python 3.11 3.12 3.13 3.14  
+Autotested with Python 3.11 3.12 3.13 3.14 3.15  
 
 ## The MCP Registry
 mcp-name: io.github.Areso/safe-ssh-mcp

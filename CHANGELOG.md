@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased - 2026-XX-XX
 ### Changed
 - paramiko and bash wrappers are now enforcing timeouts between 1 and 360 seconds
+- added Python3.15 support to CI matrix. The whole product tested on it successfully
 
 ## 0.3.1 - 2026-11-23
 ### Added
