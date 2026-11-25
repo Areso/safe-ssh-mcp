@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Pre-1.0 note:** While the version is `0.x`, the tool surface (tool names and
 > parameters) is still considered unstable and may change between minor releases.
+## Unreleased
+### Added
+- `get_lspci`: the PCI devices of the host (`lspci -nnk`): class, `[vendor:device]` IDs and
+  the kernel driver in use. Where pciutils is missing (Alpine, minimal images) one line per
+  device from `/sys/bus/pci/devices`: class, IDs, subsystem IDs and driver, without names.
+
 ## 0.3.2 - 2026-11-24
 ### Added
 - `get_process_info`: one process by `pid`, `name` (its COMM, matched exactly) or both (then

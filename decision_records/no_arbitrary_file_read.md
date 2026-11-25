@@ -45,6 +45,7 @@ Counters and kernel state, no user data. Not redacted.
 |---|---|
 | `/proc/cpuinfo` | `get_cpu_info` (without lscpu, and the MHz line) |
 | `/proc/meminfo` | `get_free_memory` |
+| `/sys/bus/pci/devices/*/{class,vendor,device,subsystem_vendor,subsystem_device}`, `readlink` of `driver` | `get_lspci` (without pciutils) |
 | `/proc/pressure/{cpu,io,memory}` | `get_pressure` |
 | `/proc/stat`, `/proc/uptime`, `/proc/diskstats`, `ls /sys/block` | `get_iostat`, `get_mpstat` (only without sysstat) |
 | `/proc/mounts`, `/proc/swaps` | `get_mounts` (without findmnt), `get_mount_problems`, `get_cron_jobs` / `get_crontab_tasks` (hidepid check) |

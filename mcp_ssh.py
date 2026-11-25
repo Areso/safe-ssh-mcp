@@ -2588,6 +2588,79 @@ def get_lsblk(
     cmd = LSBLK_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+LSPCI_NO_PCIUTILS_HEADER = (
+    "# lspci (pciutils) is not installed: devices from /sys/bus/pci/devices, "
+    "class and [vendor:device] IDs only, no vendor or device names"
+)
+LSPCI_NO_DEVICES = "no PCI devices (this host has no PCI bus, e.g. a VM with virtio-mmio devices)"
+PCI_SYSFS_DIR = "/sys/bus/pci/devices"
+# The base class of a PCI device (first byte of its class code), named as lspci names it
+PCI_BASE_CLASSES = {
+    "00": "Unclassified device", "01": "Mass storage controller", "02": "Network controller",
+    "03": "Display controller", "04": "Multimedia controller", "05": "Memory controller",
+    "06": "Bridge", "07": "Communication controller", "08": "Generic system peripheral",
+    "09": "Input device controller", "0a": "Docking station", "0b": "Processor",
+    "0c": "Serial bus controller", "0d": "Wireless controller", "0e": "Intelligent controller",
+    "0f": "Satellite communications controller", "10": "Encryption controller",
+    "11": "Signal processing controller", "12": "Processing accelerators",
+    "13": "Non-Essential Instrumentation", "40": "Coprocessor", "ff": "Unassigned class",
+}
+
+def lspci_cmd(sysfs_dir: str = PCI_SYSFS_DIR) -> str:
+    """Builds the get_lspci command: `lspci -nnk` from pciutils, or one line per device read
+    from sysfs where pciutils is missing (Alpine and minimal images; the BusyBox lspci, where
+    there is one, lacks -nn and is not used). A failing pciutils lspci is passed through.
+    sysfs_dir is there for the tests."""
+    class_case = " ".join(
+        f"{code}) name={shlex.quote(name)};;" for code, name in PCI_BASE_CLASSES.items()
+    )
+    sysfs_list = (
+        "found=; "
+        f"for d in {shlex.quote(sysfs_dir)}/*; do "
+        '[ -r "$d/class" ] || continue; found=1; '
+        'read -r cls < "$d/class"; read -r ven < "$d/vendor"; read -r dev < "$d/device"; '
+        "sub=; "
+        'if [ -r "$d/subsystem_vendor" ] && [ -r "$d/subsystem_device" ]; then '
+        'read -r sv < "$d/subsystem_vendor"; read -r sd < "$d/subsystem_device"; '
+        'sub=" (subsystem [${sv#0x}:${sd#0x}])"; fi; '
+        'drv=none; [ -L "$d/driver" ] && drv=$(basename "$(readlink "$d/driver")"); '
+        "cls=${cls#0x}; "
+        f"case ${{cls%????}} in {class_case} *) name='Unknown class';; esac; "
+        'echo "${d##*/} $name [${cls%??}]: [${ven#0x}:${dev#0x}]$sub, driver: $drv"; '
+        "done; "
+        f'[ -n "$found" ] || echo {shlex.quote(LSPCI_NO_DEVICES)}'
+    )
+    return (
+        # C locale: lspci translates nothing today, but keeps the output the same everywhere
+        "LC_ALL=C; export LC_ALL; "
+        "if command -v lspci >/dev/null 2>&1 && ! lspci --help 2>&1 | grep -q BusyBox; then lspci -nnk; "
+        f"else echo {shlex.quote(LSPCI_NO_PCIUTILS_HEADER)}; {sysfs_list}; fi"
+    )
+
+@mcp.tool()
+def get_lspci(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = TIMEOUT_DEFAULT_S,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Lists the PCI devices of a remote Linux host via SSH (lspci -nnk): network, storage and
+    display controllers, bridges, GPUs and accelerators, each with its class, its
+    [vendor:device] IDs and the kernel driver in use (and the kernel modules that could drive it).
+    A device with no 'Kernel driver in use' line has no driver bound.
+    Where pciutils is not installed (e.g. Alpine), the output starts with a
+    '# lspci (pciutils) is not installed' line and lists one line per device from
+    /sys/bus/pci/devices: slot, class [code], [vendor:device] IDs, subsystem IDs and driver
+    ('none' if no driver is bound), without vendor or device names.
+    A host with no PCI bus (some VMs) gets a 'no PCI devices' line.
+    """
+    cmd = lspci_cmd()
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
 @mcp.tool()
 def get_docker_ps_all(
     host: str,

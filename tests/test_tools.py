@@ -325,6 +325,97 @@ def test_cpu_info_unreadable_cpuinfo_fails(tmp_path):
 
 
 # ============================================================
+# get_lspci — lspci -nnk, or one line per device from sysfs without pciutils
+# ============================================================
+
+def _make_pci_device(sysfs, slot, cls, ven, dev, driver=None, subsystem=("0x1af4", "0x0001")):
+    d = sysfs / slot
+    d.mkdir(parents=True)
+    (d / "class").write_text(cls + "\n")
+    (d / "vendor").write_text(ven + "\n")
+    (d / "device").write_text(dev + "\n")
+    if subsystem:
+        (d / "subsystem_vendor").write_text(subsystem[0] + "\n")
+        (d / "subsystem_device").write_text(subsystem[1] + "\n")
+    if driver:
+        drv_dir = sysfs.parent / "drivers" / driver
+        drv_dir.mkdir(parents=True, exist_ok=True)
+        (d / "driver").symlink_to(drv_dir)
+
+
+def _run_lspci_cmd(tmp_path, programs=None, sysfs=None):
+    """Runs the command against a fake sysfs directory, with only the given fake programs
+    (name -> script body) and the real grep, basename and readlink on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("grep", "basename", "readlink"):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    for name, body in (programs or {}).items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    cmd = mcp_ssh.lspci_cmd(str(sysfs or tmp_path / "devices"))
+    return subprocess.run(
+        ["/bin/bash", "-c", cmd], capture_output=True, text=True, env={"PATH": str(bin_dir)},
+    )
+
+
+def test_lspci_sends_command(mock_run_ssh_command):
+    mcp_ssh.get_lspci(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.lspci_cmd()
+
+
+def test_lspci_uses_pciutils(tmp_path):
+    result = _run_lspci_cmd(tmp_path, {"lspci": 'echo "args: $* LC_ALL=$LC_ALL"'})
+    assert result.returncode == 0
+    assert result.stdout == "args: -nnk LC_ALL=C\n"
+
+
+def test_lspci_failure_is_not_hidden(tmp_path):
+    result = _run_lspci_cmd(tmp_path, {"lspci": "echo 'pcilib: boom' >&2; exit 1"})
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "pcilib: boom" in result.stderr
+
+
+def test_lspci_without_pciutils_reads_sysfs(tmp_path):
+    sysfs = tmp_path / "devices"
+    _make_pci_device(sysfs, "0000:00:00.0", "0x060000", "0x8086", "0x1237", subsystem=None)
+    _make_pci_device(sysfs, "0000:00:03.0", "0x020000", "0x1af4", "0x1000", driver="virtio-pci")
+    _make_pci_device(sysfs, "0000:00:05.0", "0x7f0000", "0x1234", "0x5678")
+    result = _run_lspci_cmd(tmp_path, sysfs=sysfs)
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [
+        mcp_ssh.LSPCI_NO_PCIUTILS_HEADER,
+        "0000:00:00.0 Bridge [0600]: [8086:1237], driver: none",
+        "0000:00:03.0 Network controller [0200]: [1af4:1000] (subsystem [1af4:0001]), driver: virtio-pci",
+        "0000:00:05.0 Unknown class [7f00]: [1234:5678] (subsystem [1af4:0001]), driver: none",
+    ]
+
+
+def test_lspci_busybox_lspci_uses_sysfs(tmp_path):
+    sysfs = tmp_path / "devices"
+    _make_pci_device(sysfs, "0000:00:03.0", "0x010802", "0x1b36", "0x0010", driver="nvme")
+    busybox = 'if [ "$1" = --help ]; then echo "BusyBox v1.36.1 multi-call binary." >&2; exit 1; fi; echo called'
+    result = _run_lspci_cmd(tmp_path, {"lspci": busybox}, sysfs=sysfs)
+    assert result.returncode == 0
+    assert "called" not in result.stdout
+    assert result.stdout.splitlines()[1] == (
+        "0000:00:03.0 Mass storage controller [0108]: [1b36:0010] (subsystem [1af4:0001]), driver: nvme"
+    )
+
+
+@pytest.mark.parametrize("make_dir", [True, False])
+def test_lspci_no_pci_bus(tmp_path, make_dir):
+    sysfs = tmp_path / "devices"
+    if make_dir:
+        sysfs.mkdir()
+    result = _run_lspci_cmd(tmp_path, sysfs=sysfs)
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [mcp_ssh.LSPCI_NO_PCIUTILS_HEADER, mcp_ssh.LSPCI_NO_DEVICES]
+
+
+# ============================================================
 # get_iostat / get_mpstat — sysstat, or computed from /proc
 # ============================================================
 
