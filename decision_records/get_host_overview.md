@@ -12,7 +12,10 @@ path, the same default timeout. Each section names that tool in `source_tool`.
 
 v1 sections: hostname, os_release, kernel, libc, uptime, cpu, memory, pressure,
 disk_free, inode_usage, mount_problems, failed_units, top_cpu_processes,
-top_memory_processes, listening_sockets, journal_errors.
+top_memory_processes, listening_sockets, journal_errors. Added 2026-11-25: socket_summary
+(`get_socket_summary` with its default top 20, after listening_sockets): TCP connection
+counts, about 1 KB however many sockets the host has, so it does not grow the overview on
+a busy host.
 
 ## Facts only
 
@@ -38,7 +41,7 @@ the caller: `sre_agent`, another LLM client, or a person. Reasons:
   tool's 200 lines, `memory` keeps `/proc/meminfo`). Measured: 10-25 KB of JSON. Caps or
   compact variants, if they come, become builder parameters shared with the tools.
 - Root: the sections that need it for part of their output (`findmnt --verify` in
-  mount_problems, process names in listening_sockets) are included, with their tools'
+  mount_problems, process names in listening_sockets and socket_summary) are included, with their tools'
   `sudo -n` / `doas -n` fallbacks.
 
 ## One SSH channel per section, not one script
@@ -51,9 +54,9 @@ rule that the outer time limit must never fire first (a limit stops only its own
 group, see [remote_timeout.md](remote_timeout.md)).
 
 Chosen: the sections run one after another, each in its own channel on the pooled SSH
-connection, through `run_ssh_command`. One command per section: 16 sections send 16
+connection, through `run_ssh_command`. One command per section: 17 sections send 17
 commands, each the same command string its tool sends, over one SSH connection (set up
-once, or reused from the pool). A call is the same as calling those 16 tools in a row. About 4 round trips per section: 5.5-7.5 s on the
+once, or reused from the pool). A call is the same as calling those 17 tools in a row. About 4 round trips per section: 5.5-7.5 s on the
 test VMs (70 ms), which is acceptable for a first look. Identical output to the tools
 comes by construction, and the per-command timeout handling is reused unchanged.
 

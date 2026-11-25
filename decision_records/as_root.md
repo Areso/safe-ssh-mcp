@@ -20,6 +20,8 @@ These tools run their command as root when the login user is not root:
 - `get_mount_problems` — the same, for its `findmnt --verify` part only (added
   2026-11-22, see "Tools that fall back" below).
 - `get_cron_jobs` — the same (added 2026-11-22, see "Tools that fall back" below).
+- `get_socket_summary`, `get_tcp_connections` — the same, for their `ss -tanp` /
+  `netstat -tanp` part only (added 2026-11-25, see "Tools that fall back" below).
 
 The helper `as_root` picks, on the remote host:
 
@@ -98,6 +100,16 @@ The sudo/doas refusal itself is not shown. Commands for the admin's rule:
 ```
 ss -tulpn
 netstat -tulnp
+```
+
+`get_socket_summary` and `get_tcp_connections` (added 2026-11-25) do the same with the same
+line, for `ss -tanp` / `netstat -tanp` only: `ss -s`, the counting and the filtering run as the
+login user. Commands for the
+admin's rule:
+
+```
+ss -tanp
+netstat -tanp
 ```
 
 `get_process_files` (added 2026-11-17) does the same. Any user can read `/proc/<pid>/exe`

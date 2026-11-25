@@ -3458,6 +3458,252 @@ def get_listening_sockets(
     cmd = LISTENING_SOCKETS_CMD
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
+SOCKET_SUMMARY_TOP_MAX = 200
+# netstat state names (ESTABLISHED, TIME_WAIT, FIN_WAIT1, ...) as ss prints them.
+# Both socket tools also skip a line they have already seen: netstat reads /proc/net/tcp in
+# chunks, and when sockets come and go during the read it can print one twice (seen on
+# BusyBox under load). Two identical lines are the same socket: same addresses, same state.
+NETSTAT_STATE_AWK = r"""
+function ss_state(s) {
+    if (s == "ESTABLISHED") s = "ESTAB"
+    gsub(/_/, "-", s); sub(/WAIT1$/, "WAIT-1", s); sub(/WAIT2$/, "WAIT-2", s)
+    return s
+}
+"""
+SOCKET_SUMMARY_NO_SS_NOTE = "# ss is not installed: counted from netstat -tanp (no ss -s totals)"
+# Counts the TCP sockets of `ss -tanp` or `netstat -tanp` (told apart by their rows: netstat
+# ones start with tcp/tcp6) so that no raw line leaves the host: sockets by state, then
+# connections by state x direction x port x process, then peers of ESTAB connections.
+# A connection is inbound when its local port is a listening port (counted by that port),
+# else outbound (counted by peer address:port). netstat states are renamed to ss ones.
+# "# " lines (the not-run-as-root and no-ss notes) are printed first. Without a header
+# line (ss / netstat failed) nothing is printed, so the failure is not dressed up as data.
+# Top N is picked in awk: no sort pipe, whose output could overtake awk's own; and no
+# `x in arr`, which BusyBox awk gets wrong.
+SOCKET_SUMMARY_AWK = NETSTAT_STATE_AWK + r"""
+function print_top(c, n,    k, i, bk, best, groups) {
+    for (k in c) groups++
+    for (i = 1; i <= n; i++) {
+        bk = ""
+        for (k in c) if (bk == "" || c[k] > best || (c[k] == best && k < bk)) { bk = k; best = c[k] }
+        if (bk == "") break
+        printf "%5d  %s\n", best, bk
+        delete c[bk]
+    }
+    return groups
+}
+function addr(peer,    ip, p) {
+    ip = peer; sub(/:[^:]*$/, "", ip); gsub(/^\[|\]$/, "", ip); sub(/%.*/, "", ip); sub(/^::ffff:/, "", ip)
+    p = peer; sub(/.*:/, "", p)
+    pport = p
+    return ip
+}
+function row(    lport) {
+    lport = local; sub(/.*:/, "", lport)
+    states[state]++
+    if (state == "LISTEN") { listen[lport] = 1; listening++; return }
+    n++; rs[n] = state; rl[n] = lport; rp[n] = peer; rproc[n] = proc
+}
+/^# / { note[++nn] = $0; next }
+$1 == "State" || $1 == "Proto" { seen = 1; next }
+$1 == "Active" { next }
+# a socket listed twice (see NETSTAT_STATE_AWK) is counted once
+dup[$0]++ { next }
+$1 ~ /^tcp/ {
+    # BusyBox netstat shows argv[0], which sshd rewrites to "sshd-session: user [priv]"
+    state = ss_state($6); local = $4; peer = $5; proc = $7; sub(/^[0-9]+\//, "", proc); sub(/:$/, "", proc)
+    if (proc == "") proc = "-"
+    row()
+    next
+}
+NF >= 5 {
+    state = $1; local = $4; peer = $5; proc = "-"
+    if (match($0, /users:\(\("[^"]+"/)) proc = substr($0, RSTART + 9, RLENGTH - 10)
+    row()
+}
+END {
+    for (i = 1; i <= nn; i++) print note[i]
+    if (!seen) exit
+    print "== TCP sockets by state"
+    print "count  state"
+    print_top(states, 50)
+    for (i = 1; i <= n; i++) {
+        ip = addr(rp[i])
+        if (listen[rl[i]] == 1) where = ":" rl[i]
+        else where = (ip ~ /:/) ? "[" ip "]:" pport : ip ":" pport
+        conn[sprintf("%-11s %-4s %-22s %s", rs[i], (listen[rl[i]] == 1) ? "in" : "out", where, rproc[i])]++
+        if (rs[i] == "ESTAB") peers[ip]++
+    }
+    for (k in conn) groups++
+    for (k in peers) npeers++
+    print ""
+    printf "== TCP connections by state, direction, port and process: top %d of %d groups (%d connections; %d listening sockets: see get_listening_sockets)\n", top, groups, n, listening
+    print "count  state       dir  local port / peer      process"
+    print_top(conn, top)
+    print ""
+    printf "== peers of ESTAB connections: top %d of %d\n", top, npeers
+    print "count  peer"
+    print_top(peers, top)
+}
+"""
+
+def tcp_sockets_cmd(no_ss_note: str) -> str:
+    """`ss -tanp`, or BusyBox `netstat -tanp` after no_ss_note where ss is missing: every TCP
+    socket with its process. -p needs root for other users' sockets: through sudo -n /
+    doas -n, else as the login user after a note. Shared by get_socket_summary and
+    get_tcp_connections."""
+    return (
+        "if command -v ss >/dev/null 2>&1; then "
+        f"{as_root_or_plain('ss -tanp', LISTENING_SOCKETS_PLAIN_NOTE)}; "
+        "elif command -v netstat >/dev/null 2>&1; then "
+        f"echo {shlex.quote(no_ss_note)}; "
+        f"{as_root_or_plain('netstat -tanp', LISTENING_SOCKETS_PLAIN_NOTE)}; "
+        "else echo 'neither ss nor netstat is installed on this host' >&2; exit 127; fi"
+    )
+
+def socket_summary_cmd(top: int) -> str:
+    """Builds the get_socket_summary command: `ss -s`, then tcp_sockets_cmd counted on the
+    host by SOCKET_SUMMARY_AWK. The caller must have validated top."""
+    rows = tcp_sockets_cmd(SOCKET_SUMMARY_NO_SS_NOTE)
+    return (
+        "set -o pipefail; LC_ALL=C; export LC_ALL; "
+        # ss -s ends with a blank line of its own
+        "if command -v ss >/dev/null 2>&1; then echo '== ss -s'; ss -s || exit; fi; "
+        f"{{ {rows}; }} | awk -v top={top} {shlex.quote(SOCKET_SUMMARY_AWK)}"
+    )
+
+@mcp.tool()
+def get_socket_summary(
+    host: str,
+    user: str,
+    top: int = 20,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = TIMEOUT_DEFAULT_S,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Summarizes the TCP connections of a remote Linux host via SSH, as counts, so the output
+    stays small however many sockets the host has. Use it for connection leaks (many
+    CLOSE-WAIT on one process), ephemeral port exhaustion (thousands of TIME-WAIT), a dead
+    upstream (SYN-SENT to one peer), SYN floods (SYN-RECV on a listening port), a full
+    connection pool (ESTAB count to a DB port) or who is hammering the host (top peers).
+    Sections:
+    1. '== ss -s': kernel totals per protocol (TCP, UDP, RAW) and TCP state counters.
+    2. TCP sockets counted by state (LISTEN, ESTAB, TIME-WAIT, ...).
+    3. Connections counted by state, direction, port and process, top `top` groups. 'in' means
+       the local port is a listening port (shown as ':PORT'); 'out' shows the peer address:port.
+       Listening sockets themselves are only counted: see get_listening_sockets.
+    4. Peer addresses of ESTAB connections, top `top`.
+    top: how many rows sections 3 and 4 show, 1-200 (default 20).
+    Where ss is not installed (e.g. Alpine), counts netstat -tanp instead, after a
+    '# ss is not installed' line, and section 1 is missing.
+    If the login user is not root, runs through sudo -n / doas -n to get the process names of
+    all sockets; if that is not allowed, runs as the login user after a '# not run as root'
+    line (other users' sockets then show process '-').
+    """
+    if isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= SOCKET_SUMMARY_TOP_MAX:
+        return {"ok": False, "error": f"Invalid value of top, should be an integer from 1 to {SOCKET_SUMMARY_TOP_MAX}"}
+    cmd = socket_summary_cmd(top)
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+TCP_CONNECTIONS_NO_SS_NOTE = "# ss is not installed: netstat -tanp"
+# the state parameter of get_tcp_connections (ss state names) -> the State column of ss
+TCP_STATES = {
+    "established": "ESTAB", "syn-sent": "SYN-SENT", "syn-recv": "SYN-RECV",
+    "fin-wait-1": "FIN-WAIT-1", "fin-wait-2": "FIN-WAIT-2", "time-wait": "TIME-WAIT",
+    "close-wait": "CLOSE-WAIT", "last-ack": "LAST-ACK", "closing": "CLOSING", "listening": "LISTEN",
+}
+TCP_STATE_ERROR = "Invalid value of state, should be one of: all, " + ", ".join(TCP_STATES)
+TCP_CONNECTIONS_DEFAULT_LINES = 200
+# Keeps the rows of `ss -tanp` / `netstat -tanp` in the given state (ss name, "" for all)
+# whose local or peer port is the given one ("" for any), the header and the first `lines`
+# of them, as the tool printed them. The filter is here, not in ss: `ss state X` drops the
+# State column and BusyBox netstat has no filter, so both paths keep their own columns.
+# "# " lines (notes) pass through. Without a header line (ss / netstat failed) nothing
+# is printed, so the failure is not dressed up as an empty list.
+TCP_CONNECTIONS_AWK = NETSTAT_STATE_AWK + r"""
+function port_of(a) { sub(/.*:/, "", a); return a }
+/^# / { print; next }
+$1 == "State" || $1 == "Proto" { header = $0; next }
+$1 == "Active" { next }
+# a socket listed twice (see NETSTAT_STATE_AWK) is listed once
+dup[$0]++ { next }
+{
+    if ($1 ~ /^tcp/) { st = ss_state($6); l = $4; p = $5 }
+    else if (NF >= 5) { st = $1; l = $4; p = $5 }
+    else next
+    if (state != "" && st != state) next
+    if (port != "" && port_of(l) != port && port_of(p) != port) next
+    m++
+    if (m <= lines) row[m] = $0
+}
+END {
+    if (header == "") exit
+    print header
+    for (i = 1; i <= m && i <= lines; i++) print row[i]
+    if (m == 0) print "# no TCP socket matches"
+    else if (m > lines) printf "# showing the first %d of %d matching sockets: narrow with state / port, or raise lines\n", lines, m
+}
+"""
+
+def tcp_connections_cmd(state: Optional[str], tcp_port: Optional[int], lines: int) -> str:
+    """Builds the get_tcp_connections command: tcp_sockets_cmd filtered and capped on the
+    host by TCP_CONNECTIONS_AWK. The caller must have validated state (a TCP_STATES key or
+    None), tcp_port and lines."""
+    awk_vars = (
+        f"-v state={shlex.quote(TCP_STATES[state] if state else '')} "
+        f"-v port={tcp_port if tcp_port is not None else ''} -v lines={lines}"
+    )
+    return (
+        "set -o pipefail; LC_ALL=C; export LC_ALL; "
+        f"{{ {tcp_sockets_cmd(TCP_CONNECTIONS_NO_SS_NOTE)}; }} | awk {awk_vars} {shlex.quote(TCP_CONNECTIONS_AWK)}"
+    )
+
+@mcp.tool()
+def get_tcp_connections(
+    host: str,
+    user: str,
+    state: Optional[str] = None,
+    tcp_port: Optional[int] = None,
+    lines: int = TCP_CONNECTIONS_DEFAULT_LINES,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = TIMEOUT_DEFAULT_S,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Lists individual TCP sockets of a remote Linux host via SSH (raw ss -tanp lines: state,
+    queues, local and peer address:port, process), filtered and capped on the host. Use it to
+    drill into what get_socket_summary counted: which clients hold the CLOSE-WAIT connections,
+    which peer the SYN-SENT ones wait for, which ephemeral ports are in TIME-WAIT.
+    state: one of established, syn-sent, syn-recv, fin-wait-1, fin-wait-2, time-wait,
+    close-wait, last-ack, closing, listening, or all / None (default: every state).
+    tcp_port: only sockets whose local OR peer port is this one (1-65535; default: any).
+    lines: at most this many sockets, 1-1000 (default 200); the header line is kept, and a
+    last '# showing the first N of M matching sockets' line says when more matched.
+    A '# no TCP socket matches' line means nothing matched the filter.
+    Where ss is not installed (e.g. Alpine), the lines are netstat -tanp's, after a
+    '# ss is not installed' line; state still takes the ss names.
+    If the login user is not root, runs through sudo -n / doas -n to get the process names of
+    all sockets; if that is not allowed, runs as the login user after a '# not run as root'
+    line (other users' sockets then show no process).
+    """
+    if state is not None and not isinstance(state, str):
+        return {"ok": False, "error": TCP_STATE_ERROR}
+    if state is not None and state.lower() == "all":
+        state = None
+    if state is not None and state.lower() not in TCP_STATES:
+        return {"ok": False, "error": TCP_STATE_ERROR}
+    if tcp_port is not None and not is_valid_tcp_port(tcp_port):
+        return {"ok": False, "error": "Invalid value of tcp_port, should be Integer from 1 to 65535"}
+    if not is_valid_lines(lines):
+        return {"ok": False, "error": LINES_ERROR}
+    cmd = tcp_connections_cmd(state.lower() if state else None, tcp_port, lines)
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
 # Step 1, the only part that needs root: for every process whose /proc entry can be read,
 # a "P <pid> <name> <executable>" line and an "F <file>" line per file it has mapped as
 # executable code (its shared libraries). Kernel threads have no executable and are skipped,
@@ -4129,6 +4375,7 @@ HOST_OVERVIEW_SECTIONS = (
     ("top_cpu_processes", "get_ps_aux_top_cpu_consumers", PS_TOP_CPU_CMD),
     ("top_memory_processes", "get_ps_aux_top_mem_consumers", PS_TOP_MEM_CMD),
     ("listening_sockets", "get_listening_sockets", LISTENING_SOCKETS_CMD),
+    ("socket_summary", "get_socket_summary", socket_summary_cmd(20)),
     ("journal_errors", "get_journal_errors", journal_errors_cmd(200)),
 )
 # the sections whose source tool redacts its output, with that tool's patterns
@@ -4165,9 +4412,10 @@ def get_host_overview(
     mount_problems (get_mount_problems), failed_units (get_systemd_list_failed),
     top_cpu_processes (get_ps_aux_top_cpu_consumers), top_memory_processes
     (get_ps_aux_top_mem_consumers), listening_sockets (get_listening_sockets),
-    journal_errors (get_journal_errors, last 200 warnings and errors).
+    socket_summary (get_socket_summary, top 20 rows), journal_errors (get_journal_errors,
+    last 200 warnings and errors).
     Parts that need root (findmnt --verify in mount_problems, process names in
-    listening_sockets) use sudo -n / doas -n and fall back as those tools do.
+    listening_sockets and socket_summary) use sudo -n / doas -n and fall back as those tools do.
     data.sections maps each section, in this order, to {source_tool, ok, exit_code, stdout,
     stderr, seconds} plus timed_out and error when that tool's result has them. seconds is
     the time of the section's SSH call as seen from this server.

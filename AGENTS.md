@@ -14,6 +14,7 @@ scripts that cover what changed.
 | a tool's command, a builder, a new or removed tool | `.venv/bin/python scripts/ab_test/ab_test.py commands` (offline: every existing tool must send the same command unless the change meant otherwise) |
 | SSH, the remote wrapper, `timeout_wrapped` / `TIMEOUT_SCRIPT`, `_run_cmd` | `scripts/ab_test/ab_test.py fleet` and `timeouts` |
 | redaction (patterns, rule sets, which tools redact) | `scripts/redaction_test/redaction_test.py plant` then `check`, and `scripts/ab_test/ab_test.py fleet` (on output nobody planted, the only differences must be values that became `<redacted>`: check each one is a secret or an accepted over-redaction) |
+| `get_socket_summary`, `get_tcp_connections` (their commands, the awk counting and filtering, the ss / netstat paths) | `scripts/socket_load/socket_load.py run` (one VM makes TCP load against another; every generated state must show up) |
 
 - After changing a shared definition (a constant, pattern or validator such as
   `PROCESS_NAME_CHARS`, `*_PATTERN`, `is_valid_*`, `*_error`, `_SECRET_WORDS`, `AS_ROOT_PREFIX`),
@@ -56,6 +57,7 @@ blocks), even a fake one in a test. Never write such a value as one literal:
 
 ## Related
 
-- `scripts/ab_test/README.md`, `scripts/redaction_test/README.md`: how to run the live tests.
+- `scripts/ab_test/README.md`, `scripts/redaction_test/README.md`, `scripts/socket_load/README.md`:
+  how to run the live tests.
 - `decision_records/`: why things are the way they are; update the relevant record when a
   decision changes.

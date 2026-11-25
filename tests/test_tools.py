@@ -324,6 +324,290 @@ def test_cpu_info_unreadable_cpuinfo_fails(tmp_path):
 
 
 # ============================================================
+# get_socket_summary — ss -s, then ss -tanp / netstat -tanp counted on the host
+# ============================================================
+
+SS_TANP = """State      Recv-Q Send-Q  Local Address:Port    Peer Address:Port Process
+LISTEN     0      4096          0.0.0.0:22          0.0.0.0:*     users:(("sshd",pid=1431,fd=3))
+LISTEN     0      511           0.0.0.0:80          0.0.0.0:*     users:(("nginx",pid=100,fd=16))
+LISTEN     0      4096             [::]:22             [::]:*     users:(("sshd",pid=1431,fd=4))
+LISTEN     0      4096    127.0.0.53%lo:53          0.0.0.0:*     users:(("systemd-resolve",pid=599,fd=15))
+ESTAB      0      0       10.0.0.5:22         203.0.113.9:50001   users:(("sshd",pid=2000,fd=4))
+ESTAB      0      0       10.0.0.5:80         203.0.113.9:50002   users:(("nginx",pid=100,fd=22))
+ESTAB      0      0       10.0.0.5:80         198.51.100.7:40000  users:(("nginx",pid=100,fd=23))
+CLOSE-WAIT 1      0       10.0.0.5:80         198.51.100.7:40001  users:(("nginx",pid=100,fd=24))
+ESTAB      0      0       10.0.0.5:58786    192.0.2.10:5432     users:(("app",pid=300,fd=11))
+ESTAB      0      0       10.0.0.5:58787    192.0.2.10:5432     users:(("app",pid=300,fd=12))
+SYN-SENT   0      1       10.0.0.5:58788    192.0.2.11:443      users:(("app",pid=300,fd=13))
+TIME-WAIT  0      0       10.0.0.5:58789    192.0.2.10:5432
+ESTAB      0      0      [::ffff:10.0.0.5]:22 [::ffff:203.0.113.9]:50003 users:(("sshd",pid=2001,fd=4))
+ESTAB      0      0      [2001:db8::5]:58790 [2001:db8::1]:443   users:(("app",pid=300,fd=14))
+"""
+
+NETSTAT_TANP = """Active Internet connections (servers and established)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      1431/sshd
+tcp        0      0 10.0.0.5:22             203.0.113.9:50001       ESTABLISHED 2000/sshd
+tcp        0      0 10.0.0.5:58786          192.0.2.10:5432         ESTABLISHED 300/app
+tcp        0      0 10.0.0.5:58787          192.0.2.10:5432         CLOSE_WAIT  300/app
+tcp        0      0 10.0.0.5:58789          192.0.2.10:5432         TIME_WAIT   -
+tcp        0      0 10.0.0.5:58791          192.0.2.10:5432         FIN_WAIT2   -
+tcp        0      0 :::22                   :::*                    LISTEN      1431/sshd
+tcp        0      0 ::ffff:10.0.0.5:22      ::ffff:203.0.113.9:50003 ESTABLISHED 2001/sshd-session: alpine [priv]
+"""
+
+SS_S = "Total: 334\nTCP:   14 (estab 7, closed 1, orphaned 0, timewait 1)\n\n"
+
+
+_FAKE_OUTPUTS = {}
+
+
+def _fake_program(output):
+    """A script body printing output, with shell builtins only (PATH holds no cat); the text
+    is written to a file next to the fake programs by _run_socket_summary_cmd."""
+    name = f"out{len(_FAKE_OUTPUTS)}.txt"
+    _FAKE_OUTPUTS[name] = output
+    return f'while IFS= read -r l; do printf "%s\\n" "$l"; done < "$(dirname "$0")/{name}"'
+
+
+def _run_socket_summary_cmd(tmp_path, programs, top=20):
+    return _run_socket_cmd(tmp_path, programs, mcp_ssh.socket_summary_cmd(top))
+
+
+def _run_socket_cmd(tmp_path, programs, cmd):
+    """Runs cmd with only the given fake programs (name -> script body), a fake id that
+    prints 0 (root; override it for a login user without sudo/doas) and the real awk."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "awk").symlink_to(shutil.which("awk"))
+    (bin_dir / "dirname").symlink_to(shutil.which("dirname"))
+    for name, body in {"id": "echo 0", **programs}.items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    for name, text in _FAKE_OUTPUTS.items():
+        (bin_dir / name).write_text(text)
+    return subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True, env={"PATH": str(bin_dir)})
+
+
+def _ss(tanp=SS_TANP):
+    return f'if [ "$1" = -s ]; then {_fake_program(SS_S)}; else {_fake_program(tanp)}; fi'
+
+
+def _section(stdout, title):
+    """The lines of the section whose header starts with title, without its column header."""
+    lines = stdout.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(title))
+    out = []
+    for line in lines[start + 2:]:
+        if not line:
+            break
+        out.append(line.split())
+    return lines[start], out
+
+
+def test_socket_summary_sends_command(mock_run_ssh_command):
+    mcp_ssh.get_socket_summary(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.socket_summary_cmd(20)
+    mcp_ssh.get_socket_summary(host="h", user="u", top=5)
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.socket_summary_cmd(5)
+
+
+@pytest.mark.parametrize("top", [0, 201, -1, True, "20", 2.5, None])
+def test_socket_summary_invalid_top_rejected(top, mock_run_ssh_command):
+    result = mcp_ssh.get_socket_summary(host="h", user="u", top=top)
+    assert result["ok"] is False
+    mock_run_ssh_command.assert_not_called()
+
+
+def test_socket_summary_ss(tmp_path):
+    result = _run_socket_summary_cmd(tmp_path, {"ss": _ss()})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("== ss -s\n" + SS_S + "== TCP sockets by state\n")
+    _, states = _section(result.stdout, "== TCP sockets by state")
+    assert states == [["7", "ESTAB"], ["4", "LISTEN"], ["1", "CLOSE-WAIT"], ["1", "SYN-SENT"], ["1", "TIME-WAIT"]]
+    header, conns = _section(result.stdout, "== TCP connections")
+    assert header.endswith("top 20 of 7 groups (10 connections; 4 listening sockets: see get_listening_sockets)")
+    assert conns == [
+        ["2", "ESTAB", "in", ":22", "sshd"],
+        ["2", "ESTAB", "in", ":80", "nginx"],
+        ["2", "ESTAB", "out", "192.0.2.10:5432", "app"],
+        ["1", "CLOSE-WAIT", "in", ":80", "nginx"],
+        ["1", "ESTAB", "out", "[2001:db8::1]:443", "app"],
+        ["1", "SYN-SENT", "out", "192.0.2.11:443", "app"],
+        ["1", "TIME-WAIT", "out", "192.0.2.10:5432", "-"],
+    ]
+    header, peers = _section(result.stdout, "== peers of ESTAB")
+    assert header == "== peers of ESTAB connections: top 20 of 4"
+    assert peers == [["3", "203.0.113.9"], ["2", "192.0.2.10"], ["1", "198.51.100.7"], ["1", "2001:db8::1"]]
+
+
+def test_socket_summary_top_limits_rows(tmp_path):
+    result = _run_socket_summary_cmd(tmp_path, {"ss": _ss()}, top=2)
+    header, conns = _section(result.stdout, "== TCP connections")
+    assert "top 2 of 7 groups" in header
+    assert len(conns) == 2
+    _, peers = _section(result.stdout, "== peers of ESTAB")
+    assert peers == [["3", "203.0.113.9"], ["2", "192.0.2.10"]]
+
+
+def test_socket_summary_netstat(tmp_path):
+    result = _run_socket_summary_cmd(tmp_path, {"netstat": _fake_program(NETSTAT_TANP)})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == mcp_ssh.SOCKET_SUMMARY_NO_SS_NOTE
+    assert "== ss -s" not in result.stdout
+    _, states = _section(result.stdout, "== TCP sockets by state")
+    assert states == [["3", "ESTAB"], ["2", "LISTEN"], ["1", "CLOSE-WAIT"], ["1", "FIN-WAIT-2"], ["1", "TIME-WAIT"]]
+    _, conns = _section(result.stdout, "== TCP connections")
+    assert conns == [
+        ["1", "CLOSE-WAIT", "out", "192.0.2.10:5432", "app"],
+        ["1", "ESTAB", "in", ":22", "sshd"],
+        ["1", "ESTAB", "in", ":22", "sshd-session"],
+        ["1", "ESTAB", "out", "192.0.2.10:5432", "app"],
+        ["1", "FIN-WAIT-2", "out", "192.0.2.10:5432", "-"],
+        ["1", "TIME-WAIT", "out", "192.0.2.10:5432", "-"],
+    ]
+    _, peers = _section(result.stdout, "== peers of ESTAB")
+    assert peers == [["2", "203.0.113.9"], ["1", "192.0.2.10"]]
+
+
+def test_socket_summary_ss_failure_is_not_hidden(tmp_path):
+    ss = 'if [ "$1" = -s ]; then echo "ss: boom" >&2; exit 2; fi'
+    result = _run_socket_summary_cmd(tmp_path, {"ss": ss})
+    assert result.returncode == 2
+    assert result.stdout == "== ss -s\n"
+    assert "ss: boom" in result.stderr
+
+
+def test_socket_summary_ss_tanp_failure_is_not_hidden(tmp_path):
+    ss = f'if [ "$1" = -s ]; then {_fake_program(SS_S)}; else echo "ss: tanp boom" >&2; exit 3; fi'
+    result = _run_socket_summary_cmd(tmp_path, {"ss": ss})
+    assert result.returncode == 3
+    assert "== TCP" not in result.stdout
+    assert "ss: tanp boom" in result.stderr
+
+
+def test_socket_summary_neither_ss_nor_netstat(tmp_path):
+    result = _run_socket_summary_cmd(tmp_path, {})
+    assert result.returncode == 127
+    assert "neither ss nor netstat" in result.stderr
+    assert "== TCP" not in result.stdout
+
+
+def test_socket_summary_not_root_note_comes_first(tmp_path):
+    result = _run_socket_summary_cmd(tmp_path, {"ss": _ss(), "id": "echo 1000"})
+    lines = result.stdout.splitlines()
+    assert lines[lines.index("") + 1] == mcp_ssh.LISTENING_SOCKETS_PLAIN_NOTE
+    assert lines[lines.index("") + 2] == "== TCP sockets by state"
+
+
+# ============================================================
+# get_tcp_connections — raw ss -tanp / netstat -tanp lines, filtered and capped on the host
+# ============================================================
+
+def _tcp_connections(tmp_path, programs, state=None, tcp_port=None, lines=200):
+    return _run_socket_cmd(tmp_path, programs, mcp_ssh.tcp_connections_cmd(state, tcp_port, lines))
+
+
+def _ss_lines(*starts):
+    """The SS_TANP lines that start with the given text, in order, after the header."""
+    rows = SS_TANP.splitlines()
+    return [rows[0]] + [r for r in rows[1:] if r.startswith(starts)]
+
+
+def test_tcp_connections_sends_command(mock_run_ssh_command):
+    mcp_ssh.get_tcp_connections(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.tcp_connections_cmd(None, None, 200)
+    mcp_ssh.get_tcp_connections(host="h", user="u", state="CLOSE-WAIT", tcp_port=80, lines=5, port=2222)
+    args = mock_run_ssh_command.call_args[0]
+    assert args[2] == mcp_ssh.tcp_connections_cmd("close-wait", 80, 5)
+    assert args[3] == 2222  # port stays the SSH port
+    mcp_ssh.get_tcp_connections(host="h", user="u", state="all")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.tcp_connections_cmd(None, None, 200)
+
+
+@pytest.mark.parametrize("args", [
+    {"state": "estab"}, {"state": "time_wait"}, {"state": "closed"}, {"state": 1}, {"state": ""},
+    {"tcp_port": 0}, {"tcp_port": 65536}, {"tcp_port": True}, {"tcp_port": "80"},
+    {"lines": 0}, {"lines": 1001}, {"lines": "10"},
+])
+def test_tcp_connections_invalid_arguments_rejected(args, mock_run_ssh_command):
+    result = mcp_ssh.get_tcp_connections(host="h", user="u", **args)
+    assert result["ok"] is False
+    mock_run_ssh_command.assert_not_called()
+
+
+def test_tcp_connections_all(tmp_path):
+    result = _tcp_connections(tmp_path, {"ss": _ss()})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == SS_TANP
+
+
+def test_tcp_connections_state(tmp_path):
+    result = _tcp_connections(tmp_path, {"ss": _ss()}, state="established")
+    assert result.stdout.splitlines() == _ss_lines("ESTAB")
+    result = _tcp_connections(tmp_path / "2", {"ss": _ss()}, state="listening")
+    assert result.stdout.splitlines() == _ss_lines("LISTEN")
+
+
+def test_tcp_connections_port_matches_local_or_peer(tmp_path):
+    result = _tcp_connections(tmp_path, {"ss": _ss()}, tcp_port=5432)
+    assert [r.split()[0] for r in result.stdout.splitlines()[1:]] == ["ESTAB", "ESTAB", "TIME-WAIT"]
+    result = _tcp_connections(tmp_path / "2", {"ss": _ss()}, state="established", tcp_port=22)
+    assert len(result.stdout.splitlines()) == 1 + 2
+    # no partial match: 22 is not 2222 or 50022
+    result = _tcp_connections(tmp_path / "3", {"ss": _ss()}, tcp_port=2)
+    assert result.stdout.splitlines()[1:] == ["# no TCP socket matches"]
+
+
+def test_tcp_connections_lines_cap(tmp_path):
+    result = _tcp_connections(tmp_path, {"ss": _ss()}, state="established", lines=2)
+    lines = result.stdout.splitlines()
+    assert lines[:3] == _ss_lines("ESTAB")[:3]
+    assert lines[3] == "# showing the first 2 of 7 matching sockets: narrow with state / port, or raise lines"
+    assert len(lines) == 4
+
+
+def test_tcp_connections_netstat(tmp_path):
+    programs = {"netstat": _fake_program(NETSTAT_TANP)}
+    result = _tcp_connections(tmp_path, programs, state="fin-wait-2")
+    rows = NETSTAT_TANP.splitlines()
+    assert result.stdout.splitlines() == [mcp_ssh.TCP_CONNECTIONS_NO_SS_NOTE, rows[1]] + [
+        r for r in rows if "FIN_WAIT2" in r]
+    result = _tcp_connections(tmp_path / "2", programs, state="established", tcp_port=22)
+    assert result.stdout.splitlines()[2:] == [r for r in rows if "ESTABLISHED" in r and ":22 " in r]
+
+
+def test_socket_tools_count_a_repeated_line_once(tmp_path):
+    rows = NETSTAT_TANP.splitlines()
+    repeated = "\n".join(rows + [rows[3]]) + "\n"  # the first ESTABLISHED row, printed again
+    programs = {"netstat": _fake_program(repeated)}
+    result = _tcp_connections(tmp_path, programs, state="established")
+    assert result.stdout.splitlines()[2:] == [r for r in rows if "ESTABLISHED" in r]
+    result = _run_socket_summary_cmd(tmp_path / "2", programs)
+    _, states = _section(result.stdout, "== TCP sockets by state")
+    assert ["3", "ESTAB"] in states
+
+
+def test_tcp_connections_not_root_note_comes_first(tmp_path):
+    result = _tcp_connections(tmp_path, {"ss": _ss(), "id": "echo 1000"}, state="close-wait")
+    assert result.stdout.splitlines() == [mcp_ssh.LISTENING_SOCKETS_PLAIN_NOTE] + _ss_lines("CLOSE-WAIT")
+
+
+def test_tcp_connections_failure_is_not_hidden(tmp_path):
+    result = _tcp_connections(tmp_path, {"ss": "echo 'ss: boom' >&2; exit 3"})
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert "ss: boom" in result.stderr
+
+
+def test_tcp_connections_neither_ss_nor_netstat(tmp_path):
+    result = _tcp_connections(tmp_path, {})
+    assert result.returncode == 127
+    assert result.stdout == ""
+
+
+# ============================================================
 # get_lsblk — lsblk, or the same columns from /sys/block without util-linux
 # ============================================================
 

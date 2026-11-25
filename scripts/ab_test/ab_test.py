@@ -48,6 +48,9 @@ VARIANTS = {
     "get_iostat": [{"samples": 1, "interval": 2}],
     "get_mpstat": [{"samples": 1, "interval": 2}],
     "get_cpu_info": [{"include_flags": True}],
+    "get_socket_summary": [{"top": 1}, {"top": 200}, {"top": 0}],
+    "get_tcp_connections": [{"state": "established"}, {"state": "time-wait", "tcp_port": 80, "lines": 5},
+                            {"tcp_port": 22}, {"state": "ALL"}, {"state": "bad"}, {"lines": 0}],
     # REQUIRED gives it name="web-1"; name=None for a call by pid only
     "get_process_info": [{"pid": 1, "name": None}, {"name": "sshd"}, {"pid": 1, "name": "systemd"},
                          {"name": "Web Content"}],

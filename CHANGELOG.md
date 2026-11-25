@@ -16,11 +16,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interface drivers). Where usbutils is missing (Alpine, minimal images) one line per device
   from `/sys/bus/usb/devices`: bus, device, ID, the names the device reports, speed and
   interface drivers. Serial numbers are not read.
+- `get_socket_summary(top=20)`: TCP connections as counts, small however many sockets the host
+  has: `ss -s`, sockets by state, connections by state x direction x port x process and the
+  peers of ESTAB connections (top `top` rows each). Counted on the host from `ss -tanp`, or
+  `netstat -tanp` where ss is missing (Alpine). Process names through `sudo -n` / `doas -n`,
+  else as the login user with a note.
+- `get_tcp_connections(state, tcp_port, lines=200)`: the raw `ss -tanp` lines (or `netstat -tanp`
+  on Alpine) of one TCP state and / or one local-or-peer port, filtered on the host and capped
+  at `lines` with a `# showing the first N of M` line: drilling into what `get_socket_summary`
+  counted.
+- `scripts/socket_load/`: makes TCP load from one disposable VM against another (held,
+  leaked and churned connections, SYN-SENT to a blackhole) and checks that
+  `get_socket_summary` shows each state on one counted line and stays small, and that
+  `get_tcp_connections` lists and caps the sockets behind them.
 
 ### Changed
 - `get_lsblk`: where lsblk (util-linux) is missing (Alpine), the same columns are read from
   `/sys/block`, with mount points from `/proc/mounts` and `/proc/swaps`, instead of failing
   with `lsblk: not found`.
+- `get_host_overview`: new section `socket_summary` (`get_socket_summary`, top 20), after
+  `listening_sockets`.
 
 ## 0.3.2 - 2026-11-24
 ### Added
