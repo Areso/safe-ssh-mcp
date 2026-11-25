@@ -1,6 +1,6 @@
 # Safe SSH MCP Server
-A secure and scoped SSH MCP server for executing read-only diagnostic commands over SSH.  
-In this project, "safe" refers specifically to host safety: the server is designed to prevent modifications to the remote system and reduce the risk of operational harm. It does NOT attempt to guarantee that command output cannot be misused by external agents.
+A well-scoped SSH MCP server for executing read-only diagnostic commands over SSH.  
+In this project, "safe" refers specifically to the safety of the remote host: the server is designed to prevent modifications to the remote system and reduce the risk of operational harm. Secrets redaction is best-effort but not guaranteed, so keep that in mind with models that retain data or learn from it.  
 
 ## Badges
 [Snyk Vulnerability Database report](https://security.snyk.io/package/pip/safe-ssh-mcp) - security check  
@@ -12,7 +12,6 @@ The core philosophy behind this MCP server is safety first. Instead of providing
 
 ## Feedback
 
-Hi there!
 Using safe-ssh-mcp? I'd love to hear from you.
 
 Whether you're using it with Claude Code, Codex, Ollama, or another MCP client, please tell me what works and what doesn't. Even a two-sentence report is valuable.
@@ -157,6 +156,13 @@ so restrict access to the process and avoid putting it in source control.
 ## Compatibility
 Tested manually on Python3.11 running on MacOS against remote Ubuntu server  
 Autotested with Python 3.11 3.12 3.13 3.14 3.15  
+
+## STDIO vs HTTP/SSE
+The default transport is `stdio`: the MCP client starts the server as a local process, and nothing listens on the network.
+
+The HTTP transports (`streamable-http`, `sse`; set in `mcp_config.ini`) are meant to run behind a reverse proxy, which handles authentication and TLS (mTLS, OIDC, or basic auth over TLS, whatever your setup uses).  
+The server itself does not authenticate requests, so it binds to `127.0.0.1` by default: expose it only through the proxy, as its callers get
+the use of this server's SSH keys.
 
 ## The MCP Registry
 mcp-name: io.github.Areso/safe-ssh-mcp
