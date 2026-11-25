@@ -55,7 +55,6 @@ import mcp_ssh
         """echo '# BusyBox: top -b -n 1'; printf '%s\\n' "$out" | awk 'NR <= 29'; """
         """else printf '%s\\n' "$out" >&2; exit "$rc"; fi""",
     ),
-    (mcp_ssh.get_lsblk, "lsblk"),
     (mcp_ssh.get_docker_ps_all, mcp_ssh.DOCKER_PREFIX + "$DOCKER ps --all"),
     (mcp_ssh.get_docker_images, mcp_ssh.DOCKER_PREFIX + "$DOCKER images --digests"),
     (mcp_ssh.get_crontab_tasks, mcp_ssh.crontab_tasks_cmd()),
@@ -325,6 +324,107 @@ def test_cpu_info_unreadable_cpuinfo_fails(tmp_path):
 
 
 # ============================================================
+# get_lsblk — lsblk, or the same columns from /sys/block without util-linux
+# ============================================================
+
+def _make_block_device(sys_block, name, dev, sectors, removable="0", ro="0", dm_name=None, partitions=()):
+    """partitions: (name, maj:min, sectors, ro) tuples."""
+    d = sys_block / name
+    d.mkdir(parents=True)
+    for f, v in {"dev": dev, "size": sectors, "removable": removable, "ro": ro}.items():
+        (d / f).write_text(v + "\n")
+    if dm_name:
+        (d / "dm").mkdir()
+        (d / "dm" / "name").write_text(dm_name + "\n")
+    for pname, pdev, psectors, pro in partitions:
+        p = d / pname
+        p.mkdir()
+        for f, v in {"dev": pdev, "size": psectors, "ro": pro, "partition": "1"}.items():
+            (p / f).write_text(v + "\n")
+    # not a partition: holds no "partition" file
+    (d / "queue").mkdir()
+
+
+def _run_lsblk_cmd(tmp_path, programs=None, mounts="", swaps=None):
+    """Runs the command against a fake /sys/block and /proc, with only the given fake programs
+    (name -> script body) and the real awk on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "awk").symlink_to(shutil.which("awk"))
+    for name, body in (programs or {}).items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "mounts").write_text(mounts)
+    if swaps is not None:
+        (proc / "swaps").write_text(swaps)
+    cmd = mcp_ssh.lsblk_cmd(str(tmp_path / "block"), str(proc))
+    return subprocess.run(
+        ["/bin/bash", "-c", cmd], capture_output=True, text=True, env={"PATH": str(bin_dir)},
+    )
+
+
+def test_lsblk_sends_command(mock_run_ssh_command):
+    mcp_ssh.get_lsblk(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.lsblk_cmd()
+
+
+def test_lsblk_uses_util_linux(tmp_path):
+    result = _run_lsblk_cmd(tmp_path, {"lsblk": 'echo "args: [$*] LC_ALL=${LC_ALL-unset}"'})
+    assert result.returncode == 0
+    # the host's locale: in the C locale lsblk draws its tree in ASCII
+    assert result.stdout == "args: [] LC_ALL=unset\n"
+
+
+def test_lsblk_failure_is_not_hidden(tmp_path):
+    result = _run_lsblk_cmd(tmp_path, {"lsblk": "echo 'lsblk: boom' >&2; exit 32"})
+    assert result.returncode == 32
+    assert result.stdout == ""
+    assert "lsblk: boom" in result.stderr
+
+
+def test_lsblk_without_util_linux_reads_sysfs(tmp_path):
+    block = tmp_path / "block"
+    _make_block_device(block, "vda", "253:0", "20971520", partitions=[
+        ("vda1", "253:1", "18872320", "0"), ("vda15", "253:15", "217088", "0"),
+    ])
+    _make_block_device(block, "vdb", "253:16", "976", ro="1")
+    _make_block_device(block, "dm-0", "252:0", "2097152", dm_name="vg-swap")
+    _make_block_device(block, "sr0", "11:0", "3", removable="1")
+    _make_block_device(block, "loop0", "7:0", "0")
+    _make_block_device(block, "ram0", "1:0", "8192")
+    mounts = (
+        "/dev/vda1 / ext4 rw,relatime 0 0\n"
+        "/dev/vda1 /var/lib/docker ext4 rw,relatime 0 0\n"
+        "/dev/vda15 /boot/efi vfat rw 0 0\n"
+        "proc /proc proc rw 0 0\n"
+    )
+    swaps = "Filename\tType\tSize\tUsed\tPriority\n/dev/mapper/vg-swap partition 1048572 0 -2\n"
+    result = _run_lsblk_cmd(tmp_path, mounts=mounts, swaps=swaps)
+    assert result.returncode == 0, result.stderr
+    rows = [line.split() for line in result.stdout.splitlines()]
+    assert result.stdout.splitlines()[0] == mcp_ssh.LSBLK_NO_UTIL_LINUX_HEADER
+    assert rows[1] == ["NAME", "MAJ:MIN", "RM", "SIZE", "RO", "TYPE", "MOUNTPOINTS"]
+    assert rows[2:] == [
+        ["vg-swap", "252:0", "0", "1G", "0", "dm", "[SWAP]"],
+        ["sr0", "11:0", "1", "1.5K", "0", "disk"],
+        ["vda", "253:0", "0", "10G", "0", "disk"],
+        ["`-vda1", "253:1", "0", "9G", "0", "part", "/,/var/lib/docker"],
+        ["`-vda15", "253:15", "0", "106M", "0", "part", "/boot/efi"],
+        ["vdb", "253:16", "0", "488K", "1", "disk"],
+    ]
+
+
+def test_lsblk_without_util_linux_no_devices(tmp_path):
+    (tmp_path / "block").mkdir()
+    result = _run_lsblk_cmd(tmp_path)  # and no /proc/swaps: no swap support
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[2:] == [mcp_ssh.LSBLK_NO_DEVICES]
+
+
+# ============================================================
 # get_lspci — lspci -nnk, or one line per device from sysfs without pciutils
 # ============================================================
 
@@ -413,6 +513,108 @@ def test_lspci_no_pci_bus(tmp_path, make_dir):
     result = _run_lspci_cmd(tmp_path, sysfs=sysfs)
     assert result.returncode == 0
     assert result.stdout.splitlines() == [mcp_ssh.LSPCI_NO_PCIUTILS_HEADER, mcp_ssh.LSPCI_NO_DEVICES]
+
+
+# ============================================================
+# get_lsusb — lsusb and lsusb -t, or one line per device from sysfs without usbutils
+# ============================================================
+
+def _make_usb_device(sysfs, name, bus, num, ven, prod, speed="12", strings=None, interfaces=None):
+    """interfaces: interface name -> driver name (None: no driver bound)."""
+    d = sysfs / name
+    d.mkdir(parents=True)
+    for f, v in {"busnum": bus, "devnum": num, "idVendor": ven, "idProduct": prod,
+                 "speed": speed, **(strings or {})}.items():
+        if v is not None:
+            (d / f).write_text(v + "\n")
+    for intf, driver in (interfaces or {}).items():
+        i = d / intf
+        i.mkdir()
+        if driver:
+            drv_dir = sysfs.parent / "drivers" / driver
+            drv_dir.mkdir(parents=True, exist_ok=True)
+            (i / "driver").symlink_to(drv_dir)
+        # sysfs lists interfaces next to devices too
+        (sysfs / intf).symlink_to(i)
+    return d
+
+
+def _run_lsusb_cmd(tmp_path, programs=None, sysfs=None):
+    """Runs the command against a fake sysfs directory, with only the given fake programs
+    (name -> script body) and the real grep, basename and readlink on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("grep", "basename", "readlink"):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    for name, body in (programs or {}).items():
+        f = bin_dir / name
+        f.write_text("#!/bin/sh\n" + body + "\n")
+        f.chmod(0o755)
+    cmd = mcp_ssh.lsusb_cmd(str(sysfs or tmp_path / "devices"))
+    return subprocess.run(
+        ["/bin/bash", "-c", cmd], capture_output=True, text=True, env={"PATH": str(bin_dir)},
+    )
+
+
+def test_lsusb_sends_command(mock_run_ssh_command):
+    mcp_ssh.get_lsusb(host="h", user="u")
+    assert mock_run_ssh_command.call_args[0][2] == mcp_ssh.lsusb_cmd()
+
+
+def test_lsusb_uses_usbutils(tmp_path):
+    result = _run_lsusb_cmd(tmp_path, {"lsusb": 'echo "args: [$*] LC_ALL=$LC_ALL"'})
+    assert result.returncode == 0
+    assert result.stdout == "args: [] LC_ALL=C\n\nargs: [-t] LC_ALL=C\n"
+
+
+def test_lsusb_failure_is_not_hidden(tmp_path):
+    result = _run_lsusb_cmd(tmp_path, {"lsusb": "echo 'unable to initialize usb spec' >&2; exit 1"})
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.count("unable to initialize usb spec") == 1
+
+
+def test_lsusb_without_usbutils_reads_sysfs(tmp_path):
+    sysfs = tmp_path / "devices"
+    _make_usb_device(sysfs, "1-1", "1", "2", "0627", "0001",
+                     strings={"manufacturer": "QEMU", "product": "QEMU USB Tablet", "serial": "42"},
+                     interfaces={"1-1:1.0": "usbhid", "1-1:1.1": "usbhid", "1-1:1.2": None})
+    _make_usb_device(sysfs, "2-1", "2", "3", "abcd", "1234", speed="480", strings={"product": "Disk"},
+                     interfaces={"2-1:1.0": "usb-storage"})
+    _make_usb_device(sysfs, "usb1", "1", "1", "1d6b", "0001",
+                     strings={"manufacturer": "Linux 6.8.0 uhci_hcd", "product": "UHCI Host Controller"},
+                     interfaces={"1-0:1.0": "hub"})
+    _make_usb_device(sysfs, "usb2", "2", "1", "1d6b", "0002", speed=None)
+    result = _run_lsusb_cmd(tmp_path, sysfs=sysfs)
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [
+        mcp_ssh.LSUSB_NO_USBUTILS_HEADER,
+        "Bus 001 Device 002: ID 0627:0001 QEMU QEMU USB Tablet, speed 12 Mbit/s, drivers: usbhid",
+        "Bus 002 Device 003: ID abcd:1234 Disk, speed 480 Mbit/s, drivers: usb-storage",
+        "Bus 001 Device 001: ID 1d6b:0001 Linux 6.8.0 uhci_hcd UHCI Host Controller, speed 12 Mbit/s, drivers: hub",
+        "Bus 002 Device 001: ID 1d6b:0002, speed ? Mbit/s, drivers: none",
+    ]
+    assert "42" not in result.stdout
+
+
+def test_lsusb_busybox_lsusb_uses_sysfs(tmp_path):
+    sysfs = tmp_path / "devices"
+    _make_usb_device(sysfs, "usb1", "1", "1", "1d6b", "0001", interfaces={"1-0:1.0": "hub"})
+    busybox = 'if [ "$1" = --help ]; then echo "BusyBox v1.36.1 multi-call binary." >&2; exit 1; fi; echo called'
+    result = _run_lsusb_cmd(tmp_path, {"lsusb": busybox}, sysfs=sysfs)
+    assert result.returncode == 0
+    assert "called" not in result.stdout
+    assert result.stdout.splitlines()[1] == "Bus 001 Device 001: ID 1d6b:0001, speed 12 Mbit/s, drivers: hub"
+
+
+@pytest.mark.parametrize("make_dir", [True, False])
+def test_lsusb_no_usb(tmp_path, make_dir):
+    sysfs = tmp_path / "devices"
+    if make_dir:
+        sysfs.mkdir()
+    result = _run_lsusb_cmd(tmp_path, sysfs=sysfs)
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [mcp_ssh.LSUSB_NO_USBUTILS_HEADER, mcp_ssh.LSUSB_NO_DEVICES]
 
 
 # ============================================================

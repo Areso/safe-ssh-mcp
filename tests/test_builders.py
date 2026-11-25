@@ -28,7 +28,7 @@ import mcp_ssh
     (mcp_ssh.get_kernel_version, mcp_ssh.KERNEL_VERSION_CMD),
     (mcp_ssh.get_free_memory, mcp_ssh.FREE_MEMORY_CMD),
     (mcp_ssh.get_pressure, mcp_ssh.PRESSURE_CMD),
-    (mcp_ssh.get_lsblk, mcp_ssh.LSBLK_CMD),
+    (mcp_ssh.get_lsblk, mcp_ssh.lsblk_cmd()),
     (mcp_ssh.get_systemd_list_failed, mcp_ssh.SYSTEMD_FAILED_CMD),
     (mcp_ssh.get_vmstat, mcp_ssh.vmstat_cmd()),
     (mcp_ssh.get_dmesg, mcp_ssh.dmesg_cmd()),
@@ -49,7 +49,6 @@ def test_tool_sends_its_shared_command(tool, expected, mock_run_ssh_command):
     (mcp_ssh.FREE_MEMORY_CMD, "free -h && echo && cat /proc/meminfo"),
     (mcp_ssh.PRESSURE_CMD,
      """for r in cpu io memory; do echo "== $r =="; cat /proc/pressure/$r 2>/dev/null || echo 'PSI not supported'; done"""),
-    (mcp_ssh.LSBLK_CMD, "lsblk"),
     (mcp_ssh.SYSTEMD_FAILED_CMD, "systemctl list-units --state=failed --no-pager"),
 ])
 def test_shared_command_values(value, expected):

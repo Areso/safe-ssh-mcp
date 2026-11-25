@@ -46,9 +46,11 @@ Counters and kernel state, no user data. Not redacted.
 | `/proc/cpuinfo` | `get_cpu_info` (without lscpu, and the MHz line) |
 | `/proc/meminfo` | `get_free_memory` |
 | `/sys/bus/pci/devices/*/{class,vendor,device,subsystem_vendor,subsystem_device}`, `readlink` of `driver` | `get_lspci` (without pciutils) |
+| `/sys/bus/usb/devices/*/{busnum,devnum,idVendor,idProduct,manufacturer,product,speed}`, `readlink` of each interface's `driver` | `get_lsusb` (without usbutils); not `serial` |
+| `/sys/block/*/{dev,size,removable,ro,dm/name}` and the same files of each partition | `get_lsblk` (without lsblk) |
 | `/proc/pressure/{cpu,io,memory}` | `get_pressure` |
 | `/proc/stat`, `/proc/uptime`, `/proc/diskstats`, `ls /sys/block` | `get_iostat`, `get_mpstat` (only without sysstat) |
-| `/proc/mounts`, `/proc/swaps` | `get_mounts` (without findmnt), `get_mount_problems`, `get_cron_jobs` / `get_crontab_tasks` (hidepid check) |
+| `/proc/mounts`, `/proc/swaps` | `get_mounts` (without findmnt), `get_mount_problems`, `get_lsblk` (without lsblk), `get_cron_jobs` / `get_crontab_tasks` (hidepid check) |
 | `/proc/sys/kernel/hostname` | `get_hostname` (when `uname -n` fails) |
 | `/proc/<pid>/comm` | `get_cron_jobs`, `get_crontab_tasks` (is a cron daemon running), `get_process_files` |
 | `/proc/<pid>/maps`, `readlink /proc/<pid>/exe` | `get_process_files`: only the paths of mapped executable files, not memory |

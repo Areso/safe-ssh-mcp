@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_lspci`: the PCI devices of the host (`lspci -nnk`): class, `[vendor:device]` IDs and
   the kernel driver in use. Where pciutils is missing (Alpine, minimal images) one line per
   device from `/sys/bus/pci/devices`: class, IDs, subsystem IDs and driver, without names.
+- `get_lsusb`: the USB devices of the host (`lsusb`, then `lsusb -t` for the tree, speeds and
+  interface drivers). Where usbutils is missing (Alpine, minimal images) one line per device
+  from `/sys/bus/usb/devices`: bus, device, ID, the names the device reports, speed and
+  interface drivers. Serial numbers are not read.
+
+### Changed
+- `get_lsblk`: where lsblk (util-linux) is missing (Alpine), the same columns are read from
+  `/sys/block`, with mount points from `/proc/mounts` and `/proc/swaps`, instead of failing
+  with `lsblk: not found`.
 
 ## 0.3.2 - 2026-11-24
 ### Added

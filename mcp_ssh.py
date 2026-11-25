@@ -2570,7 +2570,68 @@ def get_cpu_info(
     cmd = cpu_info_cmd(include_flags)
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
-LSBLK_CMD = "lsblk"
+LSBLK_NO_UTIL_LINUX_HEADER = (
+    "# lsblk (util-linux) is not installed: block devices from /sys/block, "
+    "mount points from /proc/mounts and /proc/swaps; device-mapper devices by their dm name, "
+    "not nested under the disks they are built on"
+)
+LSBLK_NO_DEVICES = "no block devices in /sys/block"
+# Formats the rows the sysfs walk prints (type name label maj:min rm sectors ro) as lsblk
+# does: sizes of 512-byte sectors in K/M/G/T, partitions under their disk, every mount point
+# (comma-separated) or [SWAP]. Devices of size 0 (empty loop devices) are left out, as lsblk does.
+LSBLK_SYSFS_AWK = r"""
+# BusyBox awk: no `in` here, it creates the entry it tests
+function add(dev, m) { mp[dev] = (mp[dev] == "") ? m : mp[dev] "," m }
+function human(sectors,    v, i, u, s) {
+    v = sectors * 512; split("B K M G T P", u, " "); i = 1
+    while (v >= 1024 && i < 6) { v /= 1024; i++ }
+    s = sprintf("%.1f", v); sub(/\.0$/, "", s)
+    return s u[i]
+}
+BEGIN {
+    while ((getline line < mounts) > 0) { split(line, f, " "); add(f[1], f[2]) }
+    while ((getline line < swaps) > 0) { split(line, f, " "); if (f[1] != "Filename") add(f[1], "[SWAP]") }
+    printf "%-14s %7s %2s %6s %2s %4s %s\n", "NAME", "MAJ:MIN", "RM", "SIZE", "RO", "TYPE", "MOUNTPOINTS"
+}
+$6 == 0 { next }
+{
+    n++
+    m = mp["/dev/" $2]
+    if (m == "" && $1 == "dm") m = mp["/dev/mapper/" $3]
+    name = ($1 == "part") ? "`-" $3 : $3
+    printf "%-14s %7s %2s %6s %2s %4s %s\n", name, $4, $5, human($6), $7, $1, m
+}
+END { if (!n) print none }
+"""
+
+def lsblk_cmd(sys_block_dir: str = "/sys/block", proc_dir: str = "/proc") -> str:
+    """Builds the get_lsblk command: lsblk from util-linux, or the same main columns read
+    from /sys/block where lsblk is missing (Alpine: BusyBox has no lsblk).
+    A failing lsblk is passed through. sys_block_dir and proc_dir are there for the tests."""
+    sysfs_rows = (
+        f"for d in {shlex.quote(sys_block_dir)}/*; do n=${{d##*/}}; "
+        # ram disks are left out by lsblk too
+        'case $n in ram*) continue;; esac; [ -r "$d/size" ] || continue; '
+        "t=disk; label=$n; case $n in loop*) t=loop;; esac; "
+        '[ -r "$d/dm/name" ] && read -r label < "$d/dm/name" && t=dm; '
+        'read -r dev < "$d/dev"; read -r rm < "$d/removable"; read -r size < "$d/size"; read -r ro < "$d/ro"; '
+        'echo "$t $n $label $dev $rm $size $ro"; '
+        'for p in "$d/$n"*; do [ -r "$p/partition" ] || continue; '
+        'read -r dev < "$p/dev"; read -r size < "$p/size"; read -r pro < "$p/ro"; '
+        'echo "part ${p##*/} ${p##*/} $dev $rm $size $pro"; done; '
+        "done"
+    )
+    awk_vars = (
+        f"-v mounts={shlex.quote(proc_dir + '/mounts')} -v swaps={shlex.quote(proc_dir + '/swaps')} "
+        f"-v none={shlex.quote(LSBLK_NO_DEVICES)}"
+    )
+    return (
+        # lsblk keeps the host's locale: in the C locale it draws its tree in ASCII
+        "if command -v lsblk >/dev/null 2>&1; then lsblk; "
+        f"else echo {shlex.quote(LSBLK_NO_UTIL_LINUX_HEADER)}; "
+        # C locale: awk's %.1f could otherwise print a decimal comma
+        f"{{ {sysfs_rows}; }} | LC_ALL=C awk {awk_vars} {shlex.quote(LSBLK_SYSFS_AWK)}; fi"
+    )
 
 @mcp.tool()
 def get_lsblk(
@@ -2583,9 +2644,15 @@ def get_lsblk(
     accept_new_hostkey: bool = False,
 ) -> Dict[str, Any]:
     """
-    Collects lsblk output from a remote Linux host via SSH
+    Lists the block devices of a remote Linux host via SSH (lsblk): disks, their partitions,
+    loop and device-mapper (LVM, LUKS) devices, with MAJ:MIN, removable (RM), size,
+    read-only (RO), type and mount points ([SWAP] for swap).
+    Where lsblk is not installed (e.g. Alpine), the output starts with a
+    '# lsblk (util-linux) is not installed' line and lists the same columns read from
+    /sys/block, /proc/mounts and /proc/swaps; device-mapper devices are listed by their
+    dm name and not nested under the disks they are built on.
     """
-    cmd = LSBLK_CMD
+    cmd = lsblk_cmd()
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 LSPCI_NO_PCIUTILS_HEADER = (
@@ -2659,6 +2726,68 @@ def get_lspci(
     A host with no PCI bus (some VMs) gets a 'no PCI devices' line.
     """
     cmd = lspci_cmd()
+    return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
+
+LSUSB_NO_USBUTILS_HEADER = (
+    "# lsusb (usbutils) is not installed: devices from /sys/bus/usb/devices, "
+    "names as the devices report them, drivers of their interfaces"
+)
+LSUSB_NO_DEVICES = "no USB devices (this host has no USB controller, or none is visible)"
+USB_SYSFS_DIR = "/sys/bus/usb/devices"
+
+def lsusb_cmd(sysfs_dir: str = USB_SYSFS_DIR) -> str:
+    """Builds the get_lsusb command: `lsusb` then `lsusb -t` from usbutils, or one line per
+    device read from sysfs where usbutils is missing (Alpine and minimal images; the BusyBox
+    lsusb, where there is one, has no names, speeds or drivers and is not used).
+    A failing usbutils lsusb is passed through. Serial numbers are never read.
+    sysfs_dir is there for the tests."""
+    sysfs_list = (
+        "found=; "
+        f"for d in {shlex.quote(sysfs_dir)}/*; do "
+        # interfaces (1-1:1.0) are listed here too; only devices have idVendor
+        '[ -r "$d/idVendor" ] || continue; found=1; '
+        'read -r bus < "$d/busnum"; read -r num < "$d/devnum"; '
+        'read -r ven < "$d/idVendor"; read -r prod < "$d/idProduct"; '
+        "name=; "
+        'for f in manufacturer product; do [ -r "$d/$f" ] && read -r v < "$d/$f" && name="$name $v"; done; '
+        'speed=; [ -r "$d/speed" ] && read -r speed < "$d/speed"; '
+        "drivers=; "
+        'for i in "$d"/*:*; do [ -L "$i/driver" ] || continue; x=$(basename "$(readlink "$i/driver")"); '
+        'case " $drivers " in *" $x "*) ;; *) drivers="${drivers:+$drivers }$x";; esac; done; '
+        """printf 'Bus %03d Device %03d: ID %s:%s%s, speed %s Mbit/s, drivers: %s\\n' """
+        '"$bus" "$num" "$ven" "$prod" "$name" "${speed:-?}" "${drivers:-none}"; '
+        "done; "
+        f'[ -n "$found" ] || echo {shlex.quote(LSUSB_NO_DEVICES)}'
+    )
+    return (
+        "LC_ALL=C; export LC_ALL; "
+        "if command -v lsusb >/dev/null 2>&1 && ! lsusb --help 2>&1 | grep -q BusyBox; then "
+        "lsusb || exit; echo; lsusb -t; "
+        f"else echo {shlex.quote(LSUSB_NO_USBUTILS_HEADER)}; {sysfs_list}; fi"
+    )
+
+@mcp.tool()
+def get_lsusb(
+    host: str,
+    user: str,
+    port: int = 22,
+    password: Optional[str] = None,
+    key_path: Optional[str] = None,
+    timeout: int = TIMEOUT_DEFAULT_S,
+    accept_new_hostkey: bool = False,
+) -> Dict[str, Any]:
+    """
+    Lists the USB devices of a remote Linux host via SSH: `lsusb` (bus, device number,
+    [vendor:product] ID and name of each device, root hubs included), then `lsusb -t`
+    (the device tree: which port each device is on, its class, the driver bound to each
+    interface, e.g. usbhid, usb-storage, uas, and the speed).
+    Where usbutils is not installed (e.g. Alpine), the output starts with a
+    '# lsusb (usbutils) is not installed' line and lists one line per device from
+    /sys/bus/usb/devices: bus, device number, ID, the manufacturer and product names the
+    device reports, its speed and the drivers of its interfaces ('none' if none is bound).
+    Serial numbers are not shown. A host with no USB controller gets a 'no USB devices' line.
+    """
+    cmd = lsusb_cmd()
     return run_ssh_command(host, user, cmd, port, password, key_path, timeout, accept_new_hostkey)
 
 @mcp.tool()
